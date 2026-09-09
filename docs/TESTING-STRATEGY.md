@@ -85,6 +85,26 @@ def test_audit_false_positive_files_unchanged(file_path: str) -> None:
 
 **Reference**: `tests/unit/lib/test_phase3_wrap_adoption.py::test_phase3_false_positive_files_unchanged` (Issue #1007 — Phase 3 GenAIAnalyzer adoption audit excluded 4 files that reference Analyzer classes but not GenAIAnalyzer). The docstring of each scope-lock test MUST cite the originating audit (issue number or refactor pass) and explain WHY each file is excluded.
 
+#### Settings Test Subjects: project, template and installed are three subjects
+
+Any test that reads settings JSON MUST name which of these three subjects it is testing. They are distinct and MUST NOT be used as aliases of one another. Collapsing them is what made `test_installed_settings_deny_rules` assert that a project file carried a global deny list, and fail on a correctly-configured repo (Issue #1762).
+
+| Subject | What it is | Deny-list expectation | How a test reaches it |
+|---|---|---|---|
+| **project** | `.claude/settings.json` — one repo's own settings | **Empty.** Hooks and policy live in the user-level profile; duplicating them here makes every hook run twice (measured 2026-09-03) | Read the repo file directly |
+| **template** | `plugins/autonomous-dev/templates/settings.default.json`, `plugins/autonomous-dev/config/global_settings_template.json`, and `DEFAULT_DENY_LIST` in `lib/settings_generator.py` — the canonical policy the product ships | **Non-empty and valid** | Read the source tree |
+| **installed** | A settings profile deployed into a configuration root | **Non-empty, valid, and byte-identical to its canonical source** | A fixture materializing the exact canonical bytes into `tmp_path` |
+
+Rules that follow from the table:
+
+- **Project settings carry a negative control, not a positive one.** Assert the canonical deny rules are ABSENT. Emptiness is the expected state; a non-empty intersection with the canonical corpus is the regression. Syntax validation still applies to whatever rules the file does carry.
+- **The installed subject is never `$HOME`, CI runner state, or the source checkout read as a substitute.** A test that reads ambient user state is not portable — a clean GitHub runner has no installed profile at all. Materialize the bytes into `tmp_path` and the proof runs identically on Linux CI and macOS local.
+- **Missing or stale installed bytes FAIL.** They are never skipped and never green. A skip on an absent installed profile converts a real deployment defect into a silent pass.
+- **Negative arms vary exactly one thing.** A malformed rule, an empty deny list and a missing `deny` key are three separate tests, so a red attributes to a single cause.
+- **Byte-identity has no standalone positive test.** It is enforced by the `assert _installed_profile_drift(...) is None` precondition that both negative arms (`test_stale_installed_profile_fails`, `test_missing_installed_profile_fails`) run before perturbing the fixture. A separate standalone byte-identity test was removed after mutation testing showed it killed no mutant the shared precondition did not already kill.
+
+**Reference**: `tests/regression/smoke/test_permission_glob_syntax.py` — `PROJECT_SETTINGS_PATH`, `CANONICAL_DENY_SOURCES` and the `installed_config_root` fixture are the three non-aliasable names.
+
 ### Layer 3: Property-Based Invariants
 
 **What**: Universal properties that hold across all inputs
