@@ -63,6 +63,18 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Issue #1726: canonical activity-log resolution lives in lib/path_utils.py.
+# The lib bootstrap above already put lib/ on sys.path. If it is unavailable we
+# fail loudly at call time rather than silently logging into the current
+# directory — a cwd fallback is the defect this import replaces.
+try:
+    from path_utils import LogDirResolutionError, resolve_activity_log_dir
+except ImportError:  # pragma: no cover - exercised only on a broken install
+    resolve_activity_log_dir = None  # type: ignore[assignment]
+
+    class LogDirResolutionError(RuntimeError):  # type: ignore[no-redef]
+        """Fallback when lib/path_utils.py is not importable."""
+
 # In-process cache for session date (avoids repeated file reads within same invocation)
 _SESSION_DATE_CACHE: dict = {}
 
@@ -775,44 +787,33 @@ def _resolve_current_batch_issue() -> int | None:
 
 
 def _find_log_dir() -> Path:
-    """Find the .claude/logs/activity directory.
+    """Find the project's .claude/logs/activity directory.
 
-    When running in a git worktree, resolves to the PARENT repo's .claude
-    directory so all events (worktree and main) end up in the same log file.
-    This prevents the split-log problem where downstream agents' events
-    are written to the worktree's log and missed by post-session analysis.
-    Issue #755.
+    Delegates to :func:`path_utils.resolve_activity_log_dir` — worktree parent
+    (Issue #755) -> ``CLAUDE_PROJECT_DIR`` -> project root -> loud failure.
+
+    Issue #1726: this function used to walk up from ``Path.cwd()`` to the first
+    ``.claude/`` and fall back to ``cwd/.claude/logs/activity``. A stray
+    ``.claude/`` below the repo root (two of them existed inside shipped plugin
+    source) therefore captured every hook invoked from a deeper directory,
+    permanently, and post-session analysis read a partial record for months.
+
+    Returns:
+        Absolute path to the activity-log directory (not created here).
+
+    Raises:
+        LogDirResolutionError: If no project root can be resolved.
     """
-    cwd = Path.cwd()
-
-    # Worktree detection: if CWD is inside a .worktrees/ directory,
-    # resolve to the parent repo's .claude directory via git.
-    cwd_str = str(cwd)
-    if "/.worktrees/" in cwd_str or "\\.worktrees\\" in cwd_str:
-        try:
-            import subprocess
-            result = subprocess.run(
-                ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
-                capture_output=True, text=True, timeout=5, cwd=str(cwd)
-            )
-            if result.returncode == 0:
-                common_dir = Path(result.stdout.strip())
-                # common_dir is the .git directory of the parent repo
-                parent_repo = common_dir.parent if common_dir.name == ".git" else common_dir
-                claude_dir = parent_repo / ".claude"
-                if claude_dir.exists():
-                    return claude_dir / "logs" / "activity"
-        except Exception:
-            pass  # Fall through to normal resolution
-
-    # Normal resolution: walk up to find .claude directory
-    for parent in [cwd] + list(cwd.parents):
-        claude_dir = parent / ".claude"
-        if claude_dir.exists():
-            return claude_dir / "logs" / "activity"
-
-    # Fallback to cwd
-    return cwd / ".claude" / "logs" / "activity"
+    if resolve_activity_log_dir is None:
+        raise LogDirResolutionError(
+            "lib/path_utils.py is not importable, so the activity-log directory "
+            "cannot be tied to a project root.\n"
+            "Expected: plugins/autonomous-dev/lib/ on sys.path\n"
+            "Refusing to fall back to the current directory (Issue #1726)"
+        )
+    # Normalise through the module-level Path so tests that patch
+    # ``session_activity_logger.Path`` still hand a real path to the resolver.
+    return resolve_activity_log_dir(start_path=Path(str(Path.cwd())))
 
 
 def _check_and_log_budget(

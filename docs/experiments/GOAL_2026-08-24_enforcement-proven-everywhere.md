@@ -1,7 +1,7 @@
 # GOAL — Enforcement Proven Everywhere, and Smaller
 
 **Created**: 2026-08-24 · **Revised**: 2026-08-25 (v3 — two adversarial evaluations against stated intent; #1663 answered; 13 internal contradictions fixed) · **Re-baselined**: 2026-08-28 (v4 — §5 resequenced to root-cause order; §7.5 slip counter carries forward, §7.6 added) · **v5 2026-08-29 — MECHANISM added (§2.0): every artifact answers Q1 is-it-connected and Q2 does-it-work; carrier is the existing sidecar, teeth are the existing manifest, declarations are generated, non-conformance is ratcheted. §5 resequenced into Phases 1-3. §7.5 second-rewrite clause confronted, not waived**
-**Status**: ACTIVE · **1 slip on the board (§7.5) — one more aborts. No third rewrite: if the Phase dates slip, the goal aborts.**
+**Status**: ABORTED 2026-09-06 · **§7.5 fired: the carried slip plus the missed 2026-08-31 Phase 1 deadline reached the two-slip abort threshold; Phase 2a also remained unmet after 2026-09-03. No third rewrite. Historical evidence and unfinished milestones remain below.**
 **Owner**: Andrew Kaszubski (solo dev)
 **Supersedes**: `GOAL_2026-07-31.md`
 

@@ -36,11 +36,13 @@ ENV_VAR_PYTHON_RE = re.compile(
     r"""os\.environ\.get\(['"]PIPELINE_STATE_FILE['"],\s*['"]/tmp/implement_pipeline_state\.json['"]\)"""
 )
 
-# Post-#1206 per-repo forms. implement.md and implement-batch.md no longer carry
-# the machine-global /tmp literal ANYWHERE — get_legacy_sentinel_path() resolves
+# Post-#1206 per-repo forms. NONE of implement.md, implement-batch.md or
+# implement-fix.md carries the machine-global /tmp literal any more —
+# get_legacy_sentinel_path() resolves
 # <repo>/.claude/local/implement_pipeline_state.json, which is the path the hook
-# reads. implement-fix.md still uses the older literal form, so the original
-# constants above stay in use for that file.
+# reads. implement-fix.md was the LAST holdout and was migrated with the rest;
+# the ENV_VAR_*_RE constants above now describe only the pre-migration shape and
+# are retained as the refused form, not as an expectation of any live file.
 ENV_VAR_PYTHON_PER_REPO_RE = re.compile(
     r"""_?os\.environ\.get\(['"]PIPELINE_STATE_FILE['"],\s*str\(get_legacy_sentinel_path\(\)\)\)"""
 )
@@ -244,18 +246,47 @@ class TestImplementFixMdMigration:
         assert IMPLEMENT_FIX_MD.exists(), f"Expected {IMPLEMENT_FIX_MD} to exist"
 
     def test_write_site_uses_env_var(self) -> None:
-        """Pipeline state initialization write uses os.environ.get form."""
+        """Pipeline state initialization write uses the per-repo env-var form.
+
+        Adjusted to the post-#1206/#1376 form already asserted for
+        implement.md: the env-var-honouring property this test was written for
+        (#1041/#1048) is unchanged, but the DEFAULT is now
+        ``str(get_legacy_sentinel_path())``, not the machine-global /tmp
+        literal. This test previously REQUIRED THE BUG — it asserted the /tmp
+        form and would have blocked the migration it now locks.
+        """
         text = IMPLEMENT_FIX_MD.read_text()
-        assert ENV_VAR_PYTHON_RE.search(
-            text
-        ), "implement-fix.md must use os.environ.get('PIPELINE_STATE_FILE', ...) for write"
+        assert ENV_VAR_PYTHON_PER_REPO_RE.search(text), (
+            "implement-fix.md must use "
+            "os.environ.get('PIPELINE_STATE_FILE', str(get_legacy_sentinel_path()))"
+        )
+        assert BARE_LITERAL not in text, (
+            f"{BARE_LITERAL} must not appear in implement-fix.md — "
+            "get_legacy_sentinel_path() is the only sanctioned resolution"
+        )
+        # Positive control: the replacement IS present, so this does not pass
+        # merely because the state-init write was deleted wholesale.
+        assert "get_legacy_sentinel_path()" in text
 
     def test_rm_cleanup_uses_env_var(self) -> None:
-        """The rm -f cleanup uses ${PIPELINE_STATE_FILE:-...} form."""
+        """The STEP F6.5 cleanup honours ${PIPELINE_STATE_FILE:-...}.
+
+        Same adjustment, and same reason, as ``TestImplementBatchMdMigration::
+        test_rm_cleanup_uses_env_var``: implement-fix.md never exports
+        PIPELINE_STATE_FILE, so the ``:-`` default IS the path used on every
+        ``--fix`` run.
+        """
         text = IMPLEMENT_FIX_MD.read_text()
-        assert ENV_VAR_SHELL_RE.search(
-            text
-        ), "implement-fix.md must use ${PIPELINE_STATE_FILE:-/tmp/implement_pipeline_state.json}"
+        assert ENV_VAR_SHELL_PER_REPO_RE.search(text), (
+            'implement-fix.md must contain CLEANUP_STATE_FILE="${PIPELINE_STATE_FILE:-...}"'
+        )
+        assert BARE_LITERAL not in text, (
+            f"{BARE_LITERAL} must not appear in implement-fix.md — "
+            "get_legacy_sentinel_path() is the only sanctioned resolution"
+        )
+        # Positive control: the replacement IS present, so this does not pass
+        # merely because the cleanup was deleted wholesale.
+        assert "get_legacy_sentinel_path()" in text
 
     def test_no_bare_literal_in_functional_open_or_rm_calls(self) -> None:
         """No bare (unguarded) literal in open() or rm -f calls in implement-fix.md."""

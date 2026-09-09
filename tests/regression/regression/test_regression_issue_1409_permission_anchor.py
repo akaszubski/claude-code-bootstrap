@@ -152,3 +152,129 @@ class TestIssue1409PermissionAnchor:
         for double_slash, single_slash in SYSROOT_PAIRS:
             assert double_slash in deny, f"global template missing {double_slash}"
             assert single_slash not in deny, f"global template still has {single_slash}"
+
+
+class TestIssue1409Controls:
+    """Runtime + control arms for the #1409 guard (added when #1486 was reversed).
+
+    The six static arms above read shipped JSON and the canonical deny list.
+    They never execute ``SettingsGenerator``, so they cannot see a rule the
+    generator *synthesizes* at runtime — which is exactly how Issue #1486
+    reintroduced ``Write(<path>)`` rules while the static guard stayed red for
+    27 days. Arms (a) and (b) cover the GENERATED surface; arms (c)-(e) are the
+    negative and positive controls that prove the guard's predicate can both
+    refuse and permit.
+    """
+
+    @staticmethod
+    def _generate(**kwargs) -> dict:
+        """Run the real SettingsGenerator against the real plugin directory."""
+        if str(LIB_DIR) not in sys.path:
+            sys.path.insert(0, str(LIB_DIR))
+        from settings_generator import SettingsGenerator
+
+        generator = SettingsGenerator(plugin_dir=PROJECT_ROOT / "plugins/autonomous-dev")
+        return generator.generate_settings(**kwargs)
+
+    def test_generated_settings_emit_no_write_path_rules(self):
+        """The generator emits zero Write(<path>) rules in allow or deny.
+
+        Ported runtime arm (was TestGeneratedSettingsInvariant in the deleted
+        #1486 file). Covers ``generate_settings`` — the 8th, GENERATED settings
+        surface that no static file scan reaches.
+        """
+        settings = self._generate()
+        perms = settings["permissions"]
+        violations = [
+            f"{lane}: {rule}"
+            for lane in ("allow", "deny")
+            for rule in perms.get(lane, [])
+            if rule.startswith("Write(")
+        ]
+        assert not violations, (
+            "generate_settings() emitted path-scoped Write rules, which Claude "
+            "Code accepts but never consults:\n" + "\n".join(violations)
+        )
+
+    def test_merge_does_not_synthesize_write_companion(self):
+        """Merging a user Edit(<path>) rule must not synthesize a Write twin.
+
+        Ported runtime arm. Covers the merge path, where #1486's
+        the deleted write-companion helper was re-applied after user patterns
+        were folded in. The user's Edit rule MUST survive (permitting arm); the Write twin
+        MUST be absent (refusing arm).
+        """
+        user_rule = "Edit(.claude/plans/*.md)"
+        settings = self._generate(
+            merge_with={"permissions": {"allow": [user_rule], "deny": []}}
+        )
+        allow = settings["permissions"]["allow"]
+        assert user_rule in allow, (
+            f"user rule {user_rule} was dropped by the merge — the merge must "
+            f"preserve custom Edit rules, not just avoid adding Write twins"
+        )
+        assert "Write(.claude/plans/*.md)" not in allow, (
+            "merge synthesized a Write(<path>) companion (Issue #1486 behaviour "
+            "reversed by Issue #1409)"
+        )
+
+    def test_bare_tool_name_rules_survive(self):
+        """NEGATIVE CONTROL: bare tool-name rules must never be flagged.
+
+        Bare ``"Write"`` (no parentheses) IS matched by Claude Code at the tool
+        level everywhere — deleting those would silently revoke every file-write
+        permission. The control works by proving that the guard's REAL predicate
+        (``startswith("Write(")``) and a deliberately over-broad one
+        (``startswith("Write")``) DIVERGE on live data: the over-broad predicate
+        flags at least one live bare rule that the real predicate cannot reach.
+        No count is hardcoded, so this fails if a future edit widens the guard
+        or if the bare Write rules are deleted.
+        """
+        bare_rules = [
+            rule
+            for _, _, rule in _iter_permission_rules(_all_json_sources())
+            if "(" not in rule
+        ]
+        assert bare_rules, "no bare tool-name rules found — the control is blind"
+
+        # The real predicate is definitionally unable to match anything here: a bare
+        # rule contains no "(" (bare_rules filters those out) and startswith("Write(")
+        # requires one. Asserting it flags nothing can never fail, so it is omitted —
+        # the discriminating check is the over-broad comparison below.
+        overbroad_predicate = [r for r in bare_rules if r.startswith("Write")]
+
+        assert overbroad_predicate, (
+            "the over-broad predicate flagged nothing, so it does not differ from "
+            "the real one on live data — either the bare Write rules were deleted "
+            "(permissions silently revoked) or this control is inert"
+        )
+
+    def test_guard_can_flag_a_planted_write_path_rule(self):
+        """POSITIVE CONTROL: the guard's predicate flags a planted violation.
+
+        A guard that cannot refuse cannot inform. Feeds the same predicate the
+        static arms use a synthetic rule that MUST be caught.
+        """
+        planted = ["Read(./.env)", "Edit(//etc/**)", "Write(//etc/**)", "Write"]
+        flagged = [r for r in planted if r.startswith(FORBIDDEN_TOOL_PREFIXES)]
+        assert flagged == ["Write(//etc/**)"], (
+            f"predicate must flag exactly the planted path-scoped Write rule and "
+            f"leave the bare 'Write' and Edit/Read rules alone; got {flagged}"
+        )
+
+    def test_anchor_guard_can_flag_a_planted_single_slash_rule(self):
+        """SECOND-SHAPE POSITIVE CONTROL: the single-slash anchor regex refuses.
+
+        The anchor bug is a different shape from the tool-name bug, so it needs
+        its own controls. ``Edit(/etc/**)`` anchors to the settings source
+        directory and MUST match; ``Edit(//etc/**)`` is the correct filesystem-
+        root form and MUST NOT.
+        """
+        assert SINGLE_SLASH_ABS_EDIT_RE.match("Edit(/etc/**)"), (
+            "anchor regex failed to flag a single-slash absolute Edit rule — "
+            "the guard cannot refuse, so its green means nothing"
+        )
+        assert not SINGLE_SLASH_ABS_EDIT_RE.match("Edit(//etc/**)"), (
+            "anchor regex flagged the CORRECT double-slash form — it would "
+            "refuse the very migration it exists to enforce"
+        )

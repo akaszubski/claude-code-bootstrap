@@ -196,6 +196,68 @@
 # the ONLY producer of a refusing payload, the trap routes through it rather
 # than emitting its own, and the allow tail hardcodes the literal "allow" so
 # it cannot become a refusal surface by edit.
+#
+# Issue #1588 arm 5 — ARM 2 REPEATING, FOR A DIFFERENT TRANSPORT.
+#
+# This hook's matcher is `Write|Edit|MultiEdit|NotebookEdit|mcp__.*` on every
+# settings surface that binds it, so it FIRES for MCP editing tools. It then
+# read a single key, `.tool_input.file_path` — and MCP editors never send that
+# key. `mcp__serena__replace_symbol_body` and `mcp__serena__replace_content`
+# both carry their target under `relative_path`. Measured against the live
+# script: `Write` + file_path=credentials.json denied, while the SAME path
+# under `relative_path` on three different serena writers allowed. The key
+# control is conclusive — feeding an MCP tool NAME together with a `file_path`
+# key still denied, so the tool name was never the problem. `// empty` left
+# FILE_PATH empty, every pattern missed, and the guard permitted every MCP
+# write to every protected path it claims to block.
+#
+# That is arm 2 with one word changed. Arm 2 read a key that appears in no real
+# payload; arm 5 read a key that appears in no real MCP payload. Fixing arm 2
+# for the built-in transports and stopping there is what left this open.
+#
+# THE FIX DELEGATES RATHER THAN ENUMERATING. Adding `relative_path` to the jq
+# expression would be arm 4's defect in new clothes: a list that still falls
+# through on the next server that names its argument `path`, `target_file` or
+# `uri`. `lib/tool_intent.py`'s `write_targets()` already owns the tool-name ->
+# path-key mapping for every transport in this repo, and is already the
+# canonical answer to "is this a write, and to what?" at the Issue #1435 hard
+# floor. So this file delegates to it exactly as it already delegates escaping
+# to `jq -Rs .` and the telemetry row schema to `lib/hook_telemetry.py`. A new
+# MCP writer is covered by registering it once, there — not by editing a regex
+# here that nobody will remember exists.
+#
+# IT IS A UNION, NOT A REPLACEMENT, AND THAT IS THE LOAD-BEARING CHOICE. The
+# jq `file_path` extraction is untouched and its result is always target 0. Two
+# reasons, both measured rather than assumed:
+#
+#   * DEGRADATION MUST NOT REACH THE BUILT-INS. python3 absent, tool_intent
+#     unimportable, or the classifier raising all yield zero extra targets. The
+#     jq value is still there, so a degraded host loses MCP coverage and keeps
+#     every built-in refusal. The reverse — delegating outright — would make a
+#     missing interpreter a fail-open for `Write` itself, which is the class
+#     this whole file exists to close.
+#   * A PAYLOAD WITH NO `tool_name` MUST NOT BECOME AN ALLOW. `write_targets`
+#     returns [] for an empty tool name, by design. Delegating outright would
+#     therefore have turned "I cannot attribute this call to a tool" into
+#     silent permission — a NEW fail-open, invented while closing an old one.
+#
+# The union can only ever ADD a refusal; it cannot turn any decision this hook
+# reached before into an allow. The consequence, stated rather than hidden: a
+# `Read` payload carrying a protected `file_path` still denies, as it did
+# before this change. That is over-refusal, not fail-open, and it is
+# unreachable in production because `Read` is not in this hook's matcher.
+# Narrowing it would mean making the guard SEE FEWER paths inside a change
+# whose entire purpose is making it see more.
+#
+# KNOWN GAP, RECORDED HERE AND DELIBERATELY NOT FIXED HERE: DENY_PATTERNS does
+# not match `id_rsa` or `id_ed25519`, the canonical OpenSSH private-key
+# filenames. Measured — both ALLOW, while `my_private_key` DENIES, so the
+# `private.*key` pattern works and the gap is in its coverage, not its
+# matching. That is a POLICY gap in WHAT is protected; arm 5 is an extraction
+# defect in WHICH PATHS ARE SEEN. Widening the pattern list inside this change
+# would mix the two and make the regression proof below unattributable.
+# `~/.ssh/**` is independently covered by `Edit(~/.ssh/**)` in the settings
+# deny list, so the gap is not unguarded in the meantime.
 
 set -euo pipefail
 
@@ -264,6 +326,88 @@ ASK_PROJECT_PATTERNS="PROJECT\.md$"
 # Returns 0 when FILE_PATH matches, 1 otherwise.
 matches_pattern() {
   grep -qiE "$1" <<<"$FILE_PATH"
+}
+
+# Ask the classifier which paths this tool call would WRITE, and emit them
+# NUL-delimited on stdout.
+#
+# Issue #1588 arm 5 — WHICH PATHS ARE SEEN. See the arm-5 note in the header.
+# The whole point of this function is that it does NOT know any key names:
+# ``tool_intent.write_targets`` owns the tool-name -> path-key mapping, the
+# same way ``jq -Rs .`` owns escaping and ``hook_telemetry`` owns the row
+# schema. Adding ``relative_path`` to a jq expression here would be arm 4 in
+# new clothes — a list that still falls through on the next server that says
+# ``path`` or ``target_file``.
+#
+# NUL rather than newline because a target may legitimately CONTAIN a newline;
+# the hostile-path tests feed exactly that, and a line-delimited reader would
+# split one path into two and name neither correctly in the reason.
+#
+# TOTALLY non-fatal by construction. python3 absent, tool_intent unimportable,
+# a malformed payload, an interpreter that raises — every one of them yields
+# empty stdout here, and the caller still has the jq-extracted ``file_path``.
+# Losing MCP coverage on a degraded host is acceptable; losing built-in
+# coverage is not, which is why this AUGMENTS the jq extraction rather than
+# replacing it.
+#
+# Reads TOOL_USE and LIB_DIR. Echoes zero or more NUL-terminated paths.
+_write_targets_nul() {
+  printf '%s' "$TOOL_USE" \
+    | PYTHONPATH="$LIB_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -c '
+import json
+import sys
+
+try:
+    import tool_intent
+
+    payload = json.loads(sys.stdin.read())
+    tool_name = payload.get("tool_name") or ""
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        tool_input = {}
+    out = sys.stdout.buffer
+    for target in tool_intent.write_targets(tool_name, tool_input):
+        if isinstance(target, str) and target:
+            out.write(target.encode("utf-8", "surrogateescape"))
+            out.write(b"\x00")
+    out.flush()
+except Exception:
+    pass
+' 2>/dev/null || true
+}
+
+# Test one pattern against EVERY target, not just the first.
+#
+# ``write_targets`` returns a LIST, so a decision made from ``TARGETS[0]``
+# would be a guard scoped to the first element — the same shape as a guard
+# scoped to the instance that prompted it. Any target matching is a refusal.
+#
+# It calls ``matches_pattern`` rather than matching itself, so this file still
+# has exactly ONE pattern-match site. Three sites is three chances to fix deny
+# and forget ask; that reasoning does not weaken just because the second site
+# would be a loop.
+#
+# On a match, FILE_PATH is left pointing at the OFFENDING target, so the reason
+# and the telemetry row name the path that actually tripped the rule. On no
+# match it is restored to PRIMARY_TARGET, so a later rule sees the same value
+# an earlier rule did.
+#
+# $1 pattern — extended regex
+# Returns 0 when any target matches, 1 otherwise.
+match_any_target() {
+  local pattern="$1"
+  local candidate
+  for candidate in "${TARGETS[@]}"; do
+    if [[ -z "$candidate" ]]; then
+      continue
+    fi
+    FILE_PATH="$candidate"
+    if matches_pattern "$pattern"; then
+      return 0
+    fi
+  done
+  FILE_PATH="$PRIMARY_TARGET"
+  return 1
 }
 
 # Render an arbitrary byte string as a valid JSON string literal.
@@ -465,9 +609,36 @@ TOOL_USE=$(cat)
 # the undetermined `ask` rather than into a fall-through allow.
 FILE_PATH=$(echo "$TOOL_USE" | jq -r '.tool_input.file_path // empty')
 
-# DENY class — checked first, so a path matching both (e.g. secrets/.env) is
-# refused rather than merely queried.
-if matches_pattern "$DENY_PATTERNS"; then
+# Issue #1588 arm 5 — the set of paths under consideration. See the arm-5 note
+# in the header for why this is a UNION rather than a replacement.
+#
+# Element 0 is the jq-extracted file_path and is ALWAYS present, possibly as
+# the empty string. That is deliberate on two counts: it keeps built-in
+# coverage identical on a host where the classifier cannot run, and it keeps
+# `"${TARGETS[@]}"` safe to expand under `set -u` with no special-casing.
+TARGETS=("$FILE_PATH")
+while IFS= read -r -d "" _extra_target; do
+  if [[ -n "$_extra_target" && "$_extra_target" != "$FILE_PATH" ]]; then
+    TARGETS+=("$_extra_target")
+  fi
+done < <(_write_targets_nul)
+
+# The path the reason text and the telemetry row name by default: the first
+# non-empty target. For a built-in write that is the file_path, unchanged. For
+# an MCP write, where file_path does not exist, it is the classifier's target
+# instead of the empty string the old code carried.
+for _candidate in "${TARGETS[@]}"; do
+  if [[ -n "$_candidate" ]]; then
+    FILE_PATH="$_candidate"
+    break
+  fi
+done
+PRIMARY_TARGET="$FILE_PATH"
+
+# DENY class — checked first, and across ALL targets before any ASK rule is
+# consulted, so a call touching both a denied and a merely-queried path is
+# refused rather than prompted.
+if match_any_target "$DENY_PATTERNS"; then
   deny_and_record \
     "deny" \
     "🔒 Cannot write to sensitive file: ${FILE_PATH}${NL}${NL}Protected patterns: .git/, credentials, secrets, private keys, .pem, .key" \
@@ -475,7 +646,7 @@ if matches_pattern "$DENY_PATTERNS"; then
 fi
 
 # ASK class — .env and .env.* are routine human edits, so the human decides.
-if matches_pattern "$ASK_ENV_PATTERNS"; then
+if match_any_target "$ASK_ENV_PATTERNS"; then
   deny_and_record \
     "ask" \
     "🔐 ${FILE_PATH} holds environment configuration.${NL}${NL}Editing it is normal human work but not an agent's call. Approve if you intended this write." \
@@ -484,7 +655,7 @@ fi
 
 # ASK class — PROJECT.md drives alignment validation. Automatic modification
 # would compromise it; a human edit is exactly what the rule always asked for.
-if matches_pattern "$ASK_PROJECT_PATTERNS"; then
+if match_any_target "$ASK_PROJECT_PATTERNS"; then
   deny_and_record \
     "ask" \
     "🔐 PROJECT.md is protected${NL}${NL}To update project goals/scope/constraints, edit PROJECT.md manually.${NL}Automatic modifications would compromise alignment validation." \

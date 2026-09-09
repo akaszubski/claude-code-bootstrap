@@ -41,8 +41,10 @@ ENV_VAR_FORM = re.compile(
 # <repo>/.claude/local/implement_pipeline_state.json — measured to be a
 # DIFFERENT file from the machine-global /tmp literal, and the one the hook
 # actually reads. AC1/AC2 asked for the env-var-HONOURING form; the /tmp
-# default was only the fallback it happened to ship with. implement-fix.md is
-# not migrated, so ENV_VAR_FORM above stays in use for it.
+# default was only the fallback it happened to ship with. implement-fix.md was
+# the last unmigrated coordinator and is now migrated too, so ENV_VAR_FORM
+# above describes only the REFUSED pre-migration shape and is no longer an
+# expectation of any live file.
 ENV_VAR_FORM_PER_REPO = re.compile(r"\$\{PIPELINE_STATE_FILE:-(?!/tmp/)")
 LITERAL_PATH = "/tmp/implement_pipeline_state.json"
 
@@ -50,7 +52,9 @@ LITERAL_PATH = "/tmp/implement_pipeline_state.json"
 # ---------------------------------------------------------------------------
 # AC1: implement.md heredoc sites migrated
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("doc", ["implement.md", "implement-batch.md"])
+@pytest.mark.parametrize(
+    "doc", ["implement.md", "implement-batch.md", "implement-fix.md"]
+)
 def test_spec_1048_1_implement_md_uses_env_var_form(doc: str) -> None:
     """AC1/AC2 (post-#1206/#1376): the coordinator honours $PIPELINE_STATE_FILE,
     defaulting to the per-repo get_legacy_sentinel_path() rather than /tmp."""
@@ -69,16 +73,34 @@ def test_spec_1048_1_implement_md_uses_env_var_form(doc: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# AC2: implement-batch.md and implement-fix.md migrated
-# (implement-batch.md is covered by the parametrized AC1/AC2 test above)
+# AC2: implement-batch.md and implement-fix.md migrated — BOTH are now covered
+# by the parametrized AC1/AC2 test above.
+#
+# ``test_spec_1048_2b_implement_fix_md_uses_env_var_form`` used to live here as
+# a singleton asserting ``ENV_VAR_FORM`` (the /tmp-defaulted shape). It
+# REQUIRED THE BUG: it would have refused the per-repo migration that AC2 asks
+# for. Folded into the parametrize rather than re-pointed in place, so there is
+# ONE form asserted across all three migrated coordinators instead of two.
 # ---------------------------------------------------------------------------
 
 
-def test_spec_1048_2b_implement_fix_md_uses_env_var_form() -> None:
-    """AC2: implement-fix.md must reference the env-var form."""
-    content = (COMMANDS_DIR / "implement-fix.md").read_text()
-    assert ENV_VAR_FORM.search(content), (
-        "implement-fix.md should contain ${PIPELINE_STATE_FILE:-...} form"
+def test_spec_1048_2c_pre_migration_shape_is_refused_not_expected() -> None:
+    """REFUSE arm for the retired singleton.
+
+    ``ENV_VAR_FORM`` is retained deliberately — but as the shape that must NOT
+    appear in any coordinator, not as one that must. Keeping the constant
+    without this arm would leave a dangling pattern nothing checks.
+    """
+    for doc in ("implement.md", "implement-batch.md", "implement-fix.md"):
+        content = (COMMANDS_DIR / doc).read_text()
+        assert not ENV_VAR_FORM.search(content), (
+            f"{doc} still carries the pre-migration "
+            "${PIPELINE_STATE_FILE:-/tmp/implement_pipeline_state.json} shape"
+        )
+    # Positive control: the pattern still matches the shape it describes, so
+    # this is not green merely because the regex stopped matching anything.
+    assert ENV_VAR_FORM.search(
+        'rm -- "${PIPELINE_STATE_FILE:-/tmp/implement_pipeline_state.json}"'
     )
 
 

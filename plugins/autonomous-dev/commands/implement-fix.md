@@ -90,10 +90,34 @@ Initialize the fix-mode pipeline state file BEFORE running the alignment gate pr
 
 ```bash
 python3 -c "
-import json, os, time
+import sys, os, time
+for _p in ('.claude/lib', 'plugins/autonomous-dev/lib', os.path.expanduser('~/.claude/lib')):
+    if os.path.isdir(_p):
+        sys.path.insert(0, _p)
+        break
 state = {'mode': 'fix', 'explicitly_invoked': True, 'start_time': int(time.time())}
-with open(os.environ.get('PIPELINE_STATE_FILE', '/tmp/implement_pipeline_state.json'), 'w') as f:
-    json.dump(state, f)
+# ATOMIC (Issue #1384). open(path,'w') truncates at OPEN time, so a kill
+# between the open and the json.dump left a 0-BYTE sentinel with the prior
+# content already gone; ensure_sentinel_heartbeat() then failed json.loads and
+# recreated it as a bare {session_id, recovered, recovered_at}, which
+# _is_pipeline_active() classifies NOT-active by design.
+#
+# PRECONDITION, load-bearing and deliberate: atomic_write_json requires the
+# PARENT DIRECTORY to exist and raises OSError from mkstemp if it does not.
+# There is NO 'mkdir -p' here and NO 'export PIPELINE_STATE_FILE' anywhere in
+# this file (implement.md pairs those two; implement-batch.md deliberately has
+# neither and every one of its blocks resolves the same default
+# independently). Fix mode relies instead on get_legacy_sentinel_path()
+# creating <repo>/.claude/local/ as a best-effort side effect, evaluated
+# EAGERLY because it is the .get() default argument. That is cwd-dependent —
+# the marker walk must land on the real repo. Do NOT reorder this to a lazy
+# default and do NOT add 'export PIPELINE_STATE_FILE'.
+from pathlib import Path
+from pipeline_state import atomic_write_json, get_legacy_sentinel_path
+atomic_write_json(
+    Path(os.environ.get('PIPELINE_STATE_FILE', str(get_legacy_sentinel_path()))),
+    state,
+)
 print('Pipeline state initialized for fix mode')
 "
 ```
@@ -135,7 +159,8 @@ for _p in ('.claude/lib', 'plugins/autonomous-dev/lib', os.path.expanduser('~/.c
         sys.path.insert(0, _p)
         break
 from pipeline_state import set_pipeline_base_commit
-state_path = os.environ.get('PIPELINE_STATE_FILE', '/tmp/implement_pipeline_state.json')
+from pipeline_state import get_legacy_sentinel_path
+state_path = os.environ.get('PIPELINE_STATE_FILE', str(get_legacy_sentinel_path()))
 ok = set_pipeline_base_commit('$PIPELINE_BASE_COMMIT', state_path=state_path)
 print(f'PIPELINE_BASE_COMMIT recorded: $PIPELINE_BASE_COMMIT (ok={ok})')
 "
@@ -266,11 +291,16 @@ for _p in ('.claude/lib', 'plugins/autonomous-dev/lib', os.path.expanduser('~/.c
     if os.path.isdir(_p):
         sys.path.insert(0, _p)
         break
+from pipeline_state import get_legacy_sentinel_path
 from pipeline_completion_state import resolve_session_id, record_pytest_gate_passed
 
-SESSION_ID = resolve_session_id()
+# Same canonical resolver as implement.md (Issues #904, #1093):
+# env → sentinel (mtime < 3600s) → activity log → 'unknown'.
+# sentinel_path= is REQUIRED — resolve_session_id() does not read
+# PIPELINE_STATE_FILE itself, so omitting it silently drops env honouring.
+SESSION_ID = resolve_session_id(sentinel_path=os.environ.get('PIPELINE_STATE_FILE') or None)
 # Fix mode is single-issue; recover ISSUE_NUMBER from state file if present, else 0.
-state_path = os.environ.get('PIPELINE_STATE_FILE', '/tmp/implement_pipeline_state.json')
+state_path = os.environ.get('PIPELINE_STATE_FILE', str(get_legacy_sentinel_path()))
 ISSUE_NUMBER = 0
 try:
     with open(state_path) as _f:
@@ -348,8 +378,8 @@ for _p in ('.claude/lib', 'plugins/autonomous-dev/lib', os.path.expanduser('~/.c
     if os.path.isdir(_p):
         sys.path.insert(0, _p)
         break
-from pipeline_state import get_pipeline_base_commit
-state_path = os.environ.get('PIPELINE_STATE_FILE', '/tmp/implement_pipeline_state.json')
+from pipeline_state import get_pipeline_base_commit, get_legacy_sentinel_path
+state_path = os.environ.get('PIPELINE_STATE_FILE', str(get_legacy_sentinel_path()))
 print(get_pipeline_base_commit(state_path=state_path) or '')
 ")
 # Anchor diff to PIPELINE_BASE_COMMIT so the file list reflects ONLY changes
@@ -388,8 +418,8 @@ for _p in ('.claude/lib', 'plugins/autonomous-dev/lib', os.path.expanduser('~/.c
     if os.path.isdir(_p):
         sys.path.insert(0, _p)
         break
-from pipeline_state import get_pipeline_base_commit
-state_path = os.environ.get('PIPELINE_STATE_FILE', '/tmp/implement_pipeline_state.json')
+from pipeline_state import get_pipeline_base_commit, get_legacy_sentinel_path
+state_path = os.environ.get('PIPELINE_STATE_FILE', str(get_legacy_sentinel_path()))
 print(get_pipeline_base_commit(state_path=state_path) or '')
 ")
 if [ -n "$PIPELINE_BASE_COMMIT" ]; then
@@ -643,8 +673,13 @@ After the CIA agent (STEP F5) returns, capture its full output text. This is the
 ```bash
 TODAY=$(date +%Y-%m-%d)
 ISSUE_NUMBER=$(python3 -c "
-import json, os
-state_path = os.environ.get('PIPELINE_STATE_FILE', '/tmp/implement_pipeline_state.json')
+import sys, json, os
+for _p in ('.claude/lib', 'plugins/autonomous-dev/lib', os.path.expanduser('~/.claude/lib')):
+    if os.path.isdir(_p):
+        sys.path.insert(0, _p)
+        break
+from pipeline_state import get_legacy_sentinel_path
+state_path = os.environ.get('PIPELINE_STATE_FILE', str(get_legacy_sentinel_path()))
 try:
     with open(state_path) as f:
         print(int(json.load(f).get('issue_number', 0) or 0))
@@ -680,7 +715,27 @@ CIA reports typically range 500-5000 words (3,000-30,000 bytes). A persisted fil
 
 ### STEP F6.5: Pipeline State Cleanup
 
-After STEP F6 has persisted the CIA report and verified the file size, cleanup (Issue #1411: plain `rm` with no force flag, since the shipped deny rules hard-block the force-delete flags; `--` guards dash-prefixed names, `|| true` preserves force-remove semantics): `rm -- "${PIPELINE_STATE_FILE:-/tmp/implement_pipeline_state.json}" 2>/dev/null || true`
+After STEP F6 has persisted the CIA report and verified the file size, clean up the pipeline state file:
+
+```bash
+# Issue #1376: resolve the per-repo sentinel via get_legacy_sentinel_path()
+# rather than the legacy machine-global /tmp path. This file never exports
+# PIPELINE_STATE_FILE, so the `:-` default IS the path used on every fix run —
+# a /tmp literal here deleted a file that does not exist while the real
+# sentinel accumulated under <repo>/.claude/local/.
+CLEANUP_STATE_FILE="${PIPELINE_STATE_FILE:-$(python3 -c "
+import sys, os
+for _p in ('.claude/lib', 'plugins/autonomous-dev/lib', os.path.expanduser('~/.claude/lib')):
+    if os.path.isdir(_p):
+        sys.path.insert(0, _p); break
+from pipeline_state import get_legacy_sentinel_path
+print(get_legacy_sentinel_path())
+")}"
+# Issue #1411: plain `rm` (no force flag) — the shipped deny rules
+# hard-block the force-delete flags. `--` guards dash-prefixed names,
+# `|| true` preserves force-remove semantics (no error if already gone).
+rm -- "$CLEANUP_STATE_FILE" 2>/dev/null || true
+```
 
 **FORBIDDEN** (Issue #559): Cleaning up pipeline state before STEP F5 + F6 complete. The analyst reads pipeline state — cleanup before launch loses context. The coordinator reads CIA output — cleanup before persist loses the report.
 

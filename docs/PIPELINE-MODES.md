@@ -106,11 +106,16 @@ L5   Report and finalize + push + CI analyst bg
 
 ```
 F1    Alignment check (same alignment-classifier protocol as STEP 2 — Issue #1467)
+F1.5  Pre-staged files check HARD GATE
 F2    Test context (read failing tests, locate fixtures)
 F3    Fix implementation (implementer) — regression test REQUIRED
 F3.5  Spec-blind validation HARD GATE (spec-validator)
 F4    Review + docs (bundled) + security-auditor if Security-Sensitivity Detection flags files
-F5    CI analysis (bg)
+F4.7  PROD verification checklist (conditional) HARD GATE (#1210)
+F5    CI analysis (continuous-improvement-analyst)
+F6    Persist CIA report HARD GATE (#1209)
+F6.5  Pipeline state cleanup — `rm --` (no force flag, #1411) on the sentinel
+      resolved via `get_legacy_sentinel_path()`, never a `/tmp` literal (#1376)
 ```
 
 The fix pipeline is minimal because the user is reacting to a known failure. It DOES enforce the regression test gate (any fix must add a test that would have caught the bug).
@@ -122,14 +127,14 @@ The fix pipeline is minimal because the user is reacting to a known failure. It 
 **Advisory** = Warning surfaced in output, not blocking.
 
 Gates in order of appearance:
-1. Pre-staged files (no in-flight staging area) — STEP 1 / L0
+1. Pre-staged files (no in-flight staging area) — STEP 1 / L0 / F1.5
 2. PROJECT.md alignment — two-stage gate: deterministic Stage 0 pre-check + alignment-classifier (Haiku) verdict (Issue #1467) — STEP 2 / L1 / F1 / I1.6
 3. Plan structural validation (file paths, acceptance criteria, testing strategy) — STEP 5.5c / L2.5
 4. Plan-critic verdict (composite ≥ 3.0 to PROCEED) — STEP 5.5b
 5. Test gate (0 pytest failures) — STEP 8 / L3 / F3
 6. Regression test gate (bug fixes must add a test) — STEP 8 / F3
 7. Plan-implementation alignment (< 50% scope divergence) — STEP 8
-8. Spec-blind validation verdict (PASS required) — STEP 8.5 / L3.5
+8. Spec-blind validation verdict (PASS required) — STEP 8.5 / L3.5 / F3.5
 9. Hook registration (if new hooks) — STEP 9
 10. Agent count gate (minimum agents ran) — STEP 9.5
 11. Remediation gate (validators APPROVE / PASS) — STEP 11
@@ -155,9 +160,9 @@ The `run_id` is printed at STEP 0. `--resume <id>` auto-detects the id format vi
 
 Any other format is rejected with a message listing all three accepted forms.
 
-Pipeline state for a single run is kept in `/tmp/implement_pipeline_<run_id>.json` (exported as `PIPELINE_STATE_FILE` at STEP 0) and the legacy sentinel `<repo>/.claude/local/implement_pipeline_state.json` (session-level, written for subshell fallback; resolved per-repo via `pipeline_state.get_legacy_sentinel_path()` since Issue #1206 — was machine-global `/tmp/implement_pipeline_state.json`). `SessionStart-batch-recovery.sh` auto-restores batch state after `/clear` or auto-compact.
+Pipeline state lives in the sentinel `<repo>/.claude/local/implement_pipeline_state.json` — resolved per-repo by `pipeline_state.get_legacy_sentinel_path()` since Issue #1206 (it was the machine-global `/tmp/implement_pipeline_state.json` before that), and exported as `PIPELINE_STATE_FILE` at STEP 0 of `implement.md` since Issue #1376. STEP 0 does **not** export a per-run `/tmp/implement_pipeline_<run_id>.json`; that form is legacy and survives only as (a) a GC glob (see below) and (b) a read-side fallback in `--resume` mode. Batch-worktree resume reads a genuinely different file, `/tmp/pipeline_state_<run_id>.json` (see [implement-resume.md](../commands/implement-resume.md)) — that path is correct and is not the sentinel. `SessionStart-batch-recovery.sh` auto-restores batch state after `/clear` or auto-compact.
 
-**Stale-state garbage collection (Issue #1048)**: At STEP 0, immediately before generating a new `RUN_ID`, `pipeline_completion_state._gc_stale_states()` removes any `/tmp` artifacts older than 7200 seconds (2× the staleness TTL): `pipeline_agent_completions_*.json` (both sha256 and run_id paths), `implement_pipeline_*.json` (per-run sentinel files), and `pipeline_*.lock` (orphaned lockfiles). This prevents `/tmp` accumulation from long-lived Claude Code sessions without relying on OS temp-file reaping. All shell references to the sentinel file in `implement.md`, `implement-batch.md`, and `implement-fix.md` use the env-var-aware form `${PIPELINE_STATE_FILE:-/tmp/implement_pipeline_state.json}` so the override is respected everywhere. Note: `PIPELINE_STATE_FILE` now defaults to the per-repo path `<repo>/.claude/local/implement_pipeline_state.json` (resolved by `get_legacy_sentinel_path()`) rather than the legacy `/tmp/` literal (Issue #1206).
+**Stale-state garbage collection (Issue #1048)**: At STEP 0, immediately before generating a new `RUN_ID`, `pipeline_completion_state._gc_stale_states()` removes any `/tmp` artifacts older than 7200 seconds (2× the staleness TTL): `pipeline_agent_completions_*.json` (both sha256 and run_id paths), `implement_pipeline_*.json` (per-run sentinel files), and `pipeline_*.lock` (orphaned lockfiles). This prevents `/tmp` accumulation from long-lived Claude Code sessions without relying on OS temp-file reaping. Every reference to the sentinel in `implement.md`, `implement-batch.md`, and `implement-fix.md` is env-var-aware AND resolves its default through `get_legacy_sentinel_path()` — shell sites use `"${PIPELINE_STATE_FILE:-$(python3 -c '… print(get_legacy_sentinel_path())')}"` and Python sites use `os.environ.get('PIPELINE_STATE_FILE', str(get_legacy_sentinel_path()))`. A bare `${PIPELINE_STATE_FILE:-/tmp/implement_pipeline_state.json}` is no longer correct anywhere: only `implement.md` exports `PIPELINE_STATE_FILE`, so in `--batch` and `--fix` the `:-` default IS the path used on every run, and a `/tmp` literal there addressed a file that does not exist while the real sentinel accumulated under `<repo>/.claude/local/`. `implement-fix.md` was the last holdout and was migrated in Issue #1376; the contract is now pinned mechanically by `tests/regression/test_implement_md_state_contract.py`, which refuses a `/tmp` sentinel default in **any** `commands/*.md` whose text mentions `PIPELINE_STATE_FILE` or `resolve_session_id`.
 
 **PIPELINE_BASE_COMMIT anchoring (Issue #1069)**: At STEP 0 (full pipeline) and STEP F1 (fix pipeline), the coordinator captures `git rev-parse HEAD` as `PIPELINE_BASE_COMMIT` and persists it to the legacy sentinel state file via `pipeline_state.set_pipeline_base_commit()`. At STEP 8.5 (spec-validator dispatch) and STEP F3.5 / STEP F4 (fix-mode spec-validator and security-sensitivity scan), the value is recovered with `pipeline_state.get_pipeline_base_commit()` and used to anchor `git diff --name-only` commands. Without anchoring, `git diff --name-only HEAD` includes files that were modified in the working tree BEFORE the pipeline started, causing spec-validator to emit false-positive FAIL verdicts for acceptance criteria that reference "files in the diff". Callers fall back to `HEAD` when `PIPELINE_BASE_COMMIT` is empty (e.g., no-commit repository, legacy pipelines, missing state file).
 
@@ -173,8 +178,9 @@ Pipeline state for a single run is kept in `/tmp/implement_pipeline_<run_id>.jso
 Every coordinator subshell that needs the current pipeline session id MUST
 resolve it with this four-step fallback. The chain is implemented in
 `resolve_session_id()` in `lib/pipeline_completion_state.py` (Issue #1093)
-and called from `commands/implement.md` at each `python3 -c "..."` heredoc
-that reads `CLAUDE_SESSION_ID`:
+and called from every coordinator — `implement.md`, `implement-batch.md` and
+`implement-fix.md` — at each `python3 -c "..."` heredoc that reads
+`CLAUDE_SESSION_ID`:
 
 1. **Environment variable** — `os.environ.get('CLAUDE_SESSION_ID')`
    - Primary source. Claude Code sets this in-process before the coordinator
@@ -203,6 +209,40 @@ that reads `CLAUDE_SESSION_ID`:
    - Returned only when env, sentinel, and activity log are all unavailable.
      Downstream code treats `'unknown'` as a first-class session id that
      stores state in its own file.
+
+### `sentinel_path=` is REQUIRED at every call site
+
+`resolve_session_id()` is keyword-only and defaults `sentinel_path` to
+`get_legacy_sentinel_path()`. It does **not** read `PIPELINE_STATE_FILE`
+itself. A bare `resolve_session_id()` therefore ignores an override and reads
+step 2 from the wrong file — silently, since the chain never raises and simply
+falls through to the activity log or `'unknown'`. Every coordinator call site
+MUST pass it explicitly:
+
+```python
+SESSION_ID = resolve_session_id(sentinel_path=os.environ.get('PIPELINE_STATE_FILE') or None)
+```
+
+`implement-fix.md`'s STEP F4 call was bare until Issue #1376; it is the last
+site to be corrected. `tests/regression/test_implement_md_state_contract.py`
+now pins this across all four coordinators
+(`test_every_call_passes_sentinel_path`), alongside a ban on hand-rolled
+`_resolve_session_id()` copies.
+
+### Sentinel writes MUST be atomic
+
+Coordinators write the sentinel with `pipeline_state.atomic_write_json()`,
+never `open(path, 'w')` and never `Path.write_text()`. `open(..., 'w')`
+truncates at OPEN time, so a crash or a concurrent write between the open and
+the `json.dump` leaves a **0-byte** sentinel with the prior content already
+gone. `ensure_sentinel_heartbeat()` then fails `json.loads` and recreates a
+bare `{session_id, recovered, recovered_at}` record, which
+`_is_pipeline_active()` classifies as NOT active by design — so the pipeline
+silently loses its recovery state and STEP 11 issue filing is blocked for the
+rest of the run (Issues #1384, #1512). `atomic_write_json()` requires the
+parent directory to exist; `get_legacy_sentinel_path()` creates
+`<repo>/.claude/local/` as a side effect, which is why it is evaluated eagerly
+as the `.get()` default rather than lazily.
 
 ### Why `'unknown'` is Preserved
 
