@@ -5683,7 +5683,7 @@ Build allow patterns from discovered commands and safe operations.
 **Returns**: List of allow patterns
 
 **Includes**:
-- **File operations**: `Read(**)`, `Write(**)`, `Edit(**)`, `Glob(**)`, `Grep(**)`
+- **File operations**: `Read(**)`, `Edit(**)`, `Grep(**)` — plus the bare tool names `Read`/`Write`/`Edit`/`Glob`/`Grep`. No path-scoped `Write(**)` or `Glob(**)` is emitted: Claude Code never consults those (Issue #1409, see note under `build_deny_list()`).
 - **Safe Bash patterns**: `Bash(git:*)`, `Bash(python:*)`, `Bash(pytest:*)`, `Bash(pip:*)`
 - **Discovered commands**: `Task(researcher)`, `Task(planner)`, etc.
 - **Standalone tools**: `Task`, `WebFetch`, `WebSearch`, `mcp__searxng__search`, `mcp__searxng__fetch`, `TodoWrite`, `NotebookEdit` (searxng entries added so a template-level searxng permission is not undone by this GENERATED list — the 8th of the 8 settings surfaces)
@@ -5692,7 +5692,7 @@ Build allow patterns from discovered commands and safe operations.
 ```python
 [
     "Read(**)",
-    "Write(**)",
+    "Edit(**)",
     "Bash(git:*)",
     "Bash(pytest:*)",
     "Task(researcher)",
@@ -5716,7 +5716,7 @@ Build comprehensive deny list of dangerous operations.
 - **Package publishing**: `Bash(npm:publish*)`, `Bash(pip:upload*)`
 - **Sensitive files**: `Read(./.env)`, `Read(~/.ssh/**)`, `Edit(//etc/**)`
 
-**Note** (Issue #1409): `DEFAULT_DENY_LIST` path-scoped file rules use `Edit(<path>)`, not `Write(<path>)` — Claude Code's file-permission matcher only honors `Edit(path)` rules for the file-editing tools (Write/Edit/NotebookEdit); `Write(path)` rules are silently ignored (a no-op deny). Absolute system paths (`/etc/**`, `/System/**`, `/usr/**`, `/root/**`) use a doubled leading slash (`//etc/**`) so the pattern anchors to the filesystem root rather than matching relative to the working directory. `Read(...)` rules and bare tool allows (`"Write"`, `"Edit"`) are unaffected.
+**Note** (Issue #1409): `DEFAULT_DENY_LIST` path-scoped file rules use `Edit(<path>)`, not `Write(<path>)` — Claude Code's file-permission matcher only honors `Edit(path)` rules for the file-editing tools (Write/Edit/NotebookEdit); `Write(path)` rules are silently ignored (a no-op deny). Absolute system paths (`/etc/**`, `/System/**`, `/usr/**`, `/root/**`) use a doubled leading slash (`//etc/**`) so the pattern anchors to the filesystem root rather than matching relative to the working directory. `Read(...)` rules and bare tool allows (`"Write"`, `"Edit"`) are unaffected. Issue #1486 briefly reversed this — it re-added a `Write(<path>)` companion for every `Edit(<path>)` rule on the premise that Edit and Write are distinct path grants — and that reversal has itself now been reversed against the primary source (Claude Code permissions docs), restoring the #1409 behaviour; the `add_write_companions()` helper it introduced is deleted.
 
 **Example**:
 ```python

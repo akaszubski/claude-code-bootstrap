@@ -2034,3 +2034,613 @@ class TestIssue1588TrapCoversEveryFallibleCommand:
             "NEGATIVE CONTROL FAILED: the checker flags a properly bounded "
             "claim, so it cannot be satisfied by any honest wording"
         )
+
+
+# ---------------------------------------------------------------------------
+# Issue #1588 arm 5 — ARM 2 REPEATING, FOR A DIFFERENT TRANSPORT.
+#
+# The hook is bound with matcher ``Write|Edit|MultiEdit|NotebookEdit|mcp__.*``
+# on every settings surface that registers it, so it FIRES for MCP editing
+# tools. It then read ONE key, ``.tool_input.file_path`` — and MCP editors
+# never send that key. Measured against the live script before the fix:
+#
+#   Write                              + file_path=.../credentials.json  deny
+#   mcp__serena__replace_symbol_body   + relative_path=.../credentials   ALLOW
+#   mcp__serena__replace_content       + relative_path=.../server.pem    ALLOW
+#   mcp__serena__insert_after_symbol   + relative_path=.../secrets.yaml  ALLOW
+#   mcp__serena__replace_symbol_body   + file_path=.../credentials.json  deny
+#
+# The last row is the conclusive control: the tool NAME was never the problem,
+# the KEY was. ``// empty`` left the variable empty, every pattern missed, and
+# the hook fell through to allow — the identical mechanism as arm 2, which read
+# ``.parameters.file_path``, "a key that appears in no real Claude Code
+# PreToolUse payload". Arm 2 was fixed for the built-in transports and stopped
+# there.
+#
+# THE FIX DELEGATES. ``lib/tool_intent.py``'s ``write_targets()`` already owns
+# the tool-name -> path-key mapping for every transport in the repo. Adding
+# ``relative_path`` to the jq expression would be arm 4's defect in new
+# clothes: a list that still falls through on the next server that names its
+# argument ``path`` or ``target_file``.
+#
+# IT IS A UNION, NOT A REPLACEMENT. The jq ``file_path`` extraction is
+# untouched and always contributes target 0, so the classifier being absent
+# costs MCP coverage and never built-in coverage. The tests below prove that
+# degradation on both arms rather than asserting it.
+# ---------------------------------------------------------------------------
+
+TOOL_INTENT_PATH = LIB_DIR / "tool_intent.py"
+
+
+def _load_tool_intent():
+    """Import the real classifier this hook now delegates to.
+
+    Loaded from disk rather than restated, so the key-enumeration check below
+    cross-validates two real sources instead of asserting against a stale
+    third copy of ``PATH_KEYS``.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "_tool_intent_for_protect_sensitive_test", TOOL_INTENT_PATH
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _mcp_payload(tool_name: str, relative_path: str, **extra) -> dict:
+    """Build a payload in the shape an MCP editor ACTUALLY sends.
+
+    Verified against the live serena tool schemas: ``replace_symbol_body``
+    requires ``name_path``/``relative_path``/``body``; ``replace_content``
+    requires ``relative_path``/``needle``/``repl``/``mode``. Neither carries
+    ``file_path`` — which is the whole of arm 5.
+
+    The extra required arguments are included rather than trimmed to the one
+    key under test: a payload the real tool would never send is a synthetic
+    input, and this file's own history is a lesson in what synthetic inputs
+    fail to catch.
+
+    Args:
+        relative_path: Value for ``tool_input.relative_path``.
+        tool_name: A member of ``tool_intent.MCP_WRITE_TOOLS``.
+        **extra: Additional ``tool_input`` members.
+
+    Returns:
+        A PreToolUse payload dict.
+    """
+    tool_input: dict = {"relative_path": relative_path}
+    tool_input.update(extra)
+    return {"tool_name": tool_name, "tool_input": tool_input}
+
+
+def _non_comment_source(text: str) -> str:
+    """Strip shell comments so prose is not read as code.
+
+    The hook's header necessarily NAMES ``relative_path`` while explaining why
+    the code must not enumerate it. Counting that explanation as an
+    enumeration is the comment-blindness error one level down — the same one
+    ``_greps_by_case`` and ``_count_refusal_emitters`` already guard against.
+    """
+    return "\n".join(_SHELL_COMMENT.sub("", ln) for ln in text.splitlines())
+
+
+def _jq_extracted_tool_input_keys(text: str) -> "set[str]":
+    """Return every ``.tool_input.<key>`` a jq expression reads in real code.
+
+    Args:
+        text: Shell source.
+
+    Returns:
+        The set of key names. ``{"file_path"}`` is the only acceptable value
+        for this hook: one key, the built-in one, with every other transport
+        resolved by the classifier instead.
+    """
+    return set(
+        re.findall(r"\.tool_input\.([A-Za-z_][A-Za-z0-9_]*)", _non_comment_source(text))
+    )
+
+
+def _enumerated_transport_keys(text: str, path_keys: "tuple[str, ...]") -> "set[str]":
+    """Return transport-specific path keys named in real code.
+
+    ``file_path`` is excluded: it is the built-in key the union deliberately
+    keeps reading directly. Every OTHER member of ``tool_intent.PATH_KEYS``
+    appearing outside a comment means this file has started enumerating keys
+    again instead of delegating.
+
+    BOUNDARY, stated rather than overclaimed: only multi-word keys are
+    checked. The bare key ``path`` is excluded because it is a substring of
+    too many legitimate shell tokens (``PYTHONPATH``, ``pathlib``) to
+    discriminate on, so a fix that enumerated ``path`` alone would slip past
+    this instrument. The behavioural arms above are what actually prove the
+    delegation; this removes the category a source read can see.
+
+    Args:
+        text: Shell source.
+        path_keys: ``tool_intent.PATH_KEYS``, read from the real module.
+
+    Returns:
+        The set of offending key names. Empty means nothing is enumerated.
+    """
+    source = _non_comment_source(text)
+    checked = [k for k in path_keys if k != "file_path" and "_" in k]
+    return {
+        key
+        for key in checked
+        if re.search(rf"(?<![A-Za-z0-9_]){re.escape(key)}(?![A-Za-z0-9_])", source)
+    }
+
+
+#: The REFUSING arm. Three different serena writers, three different DENY
+#: classes, all carrying their target under ``relative_path``. Every one of
+#: these was measured ALLOW before the fix.
+_ARM5_MCP_DENY_CASES = [
+    (
+        "mcp__serena__replace_symbol_body",
+        "app/credentials.json",
+        {"name_path": "Config/load", "body": "def load(self): ..."},
+    ),
+    (
+        "mcp__serena__replace_content",
+        "certs/server.pem",
+        {"needle": "BEGIN", "repl": "END", "mode": "literal"},
+    ),
+    (
+        "mcp__serena__insert_after_symbol",
+        "config/secrets.yaml",
+        {"name_path": "root", "body": "token: abc"},
+    ),
+]
+
+#: The PERMITTING arm. The same transport, the same key, ordinary paths. A
+#: guard that refused every MCP write would pass every test above and be
+#: useless — and ``docs/ENVIRONMENT.md`` carries the standing case-insensitive
+#: ``.env`` negative control across to the new transport, where nothing tested
+#: it before.
+_ARM5_MCP_ALLOW_CASES = [
+    (
+        "mcp__serena__replace_symbol_body",
+        "src/hello.py",
+        {"name_path": "greet", "body": "def greet(): ..."},
+    ),
+    (
+        "mcp__serena__replace_content",
+        "docs/ENVIRONMENT.md",
+        {"needle": "a", "repl": "b", "mode": "literal"},
+    ),
+]
+
+#: MUST-NOT-REGRESS. The built-in transport, across every decision class and
+#: both arms of the arm-4 case fix. The union exists so this table cannot move.
+_ARM5_BUILTIN_CASES = [
+    ("Write", "app/credentials.json", "deny"),
+    ("Write", ".env", "ask"),
+    ("Write", "src/hello.py", "allow"),
+    ("Write", "config/SECRETS.yaml", "deny"),
+    ("Write", "certs/a.PEM", "deny"),
+]
+
+
+@pytest.mark.parametrize("tool_name,relative_path,extra", _ARM5_MCP_DENY_CASES)
+def test_regression_issue_1588_arm5_mcp_writers_are_refused(
+    tool_name: str, relative_path: str, extra: dict, tmp_path: Path
+) -> None:
+    """THE REFUSING ARM. Every MCP write to a protected path was permitted.
+
+    RED BEFORE: the hook read only ``.tool_input.file_path``, MCP editors send
+    ``relative_path``, so ``FILE_PATH`` was empty, every pattern missed and the
+    hook emitted ``allow``. GREEN AFTER: the classifier resolves the target and
+    the same DENY patterns refuse it.
+
+    The refusal must also be RECORDED. A guard that refuses a whole transport
+    and logs nothing is invisible to triage for exactly the traffic that
+    prompted the fix.
+    """
+    repo = _init_repo(tmp_path / "repo")
+    result = _run_hook(_mcp_payload(tool_name, relative_path, **extra), cwd=repo)
+
+    assert _decision(result) == "deny", (
+        f"{tool_name} writing {relative_path} was PERMITTED. This hook's "
+        f"matcher includes mcp__.*, so it fires for this call and claims to "
+        f"check it. It carries its target under relative_path, not file_path "
+        f"(#1588 arm 5). stdout={result.stdout!r}"
+    )
+    rows = _read_block_rows(repo)
+    assert len(rows) == 1 and rows[0]["metadata"]["decision"] == "deny", (
+        f"{tool_name}/{relative_path}: refusal not recorded; rows={rows!r}"
+    )
+    assert rows[0]["metadata"]["file_path"] == relative_path, (
+        "the telemetry row must name the MCP target, not the empty file_path "
+        f"the old extraction produced; rows={rows!r}"
+    )
+
+
+@pytest.mark.parametrize("tool_name,relative_path,extra", _ARM5_MCP_ALLOW_CASES)
+def test_regression_issue_1588_arm5_mcp_permitting_arm(
+    tool_name: str, relative_path: str, extra: dict, tmp_path: Path
+) -> None:
+    """THE PERMITTING ARM. Widening WHICH paths are seen must not widen WHICH are protected.
+
+    A fix that classified every ``mcp__*`` call as a refusal would satisfy the
+    refusing arm above and break every LSP edit in the repo. ``docs/
+    ENVIRONMENT.md`` is the load-bearing case: it contains the letters
+    "environment" and must not trip the ``.env`` pattern on this transport any
+    more than it does on the built-in one.
+    """
+    repo = _init_repo(tmp_path / "repo")
+    result = _run_hook(_mcp_payload(tool_name, relative_path, **extra), cwd=repo)
+
+    assert _decision(result) == "allow", (
+        f"{tool_name} writing the ordinary path {relative_path} was refused. "
+        f"The arm-5 fix must widen WHICH PATHS ARE SEEN, never WHAT IS "
+        f"PROTECTED. stdout={result.stdout!r}"
+    )
+    assert _read_block_rows(repo) == [], f"{relative_path}: allow must record nothing"
+
+
+@pytest.mark.parametrize("tool_name,file_path,expected", _ARM5_BUILTIN_CASES)
+def test_regression_issue_1588_arm5_builtin_transports_did_not_regress(
+    tool_name: str, file_path: str, expected: str, tmp_path: Path
+) -> None:
+    """MUST NOT REGRESS. The built-in transport keeps every decision it had.
+
+    The fix is a UNION — the jq ``file_path`` extraction is untouched and
+    always contributes target 0 — precisely so this table cannot move. A fix
+    that replaced the extraction instead of adding to it would put every row
+    here at the mercy of an importable classifier.
+    """
+    repo = _init_repo(tmp_path / "repo")
+    result = _run_hook(_write_payload(file_path, tool_name=tool_name), cwd=repo)
+
+    assert _decision(result) == expected, (
+        f"{tool_name} {file_path}: expected {expected}, got {result.stdout!r}. "
+        f"The arm-5 fix changed built-in behaviour, which it must not."
+    )
+
+
+class TestIssue1588Arm5TheKeyNotTheName:
+    """The discriminating control: the tool NAME was never the problem."""
+
+    def test_regression_issue_1588_arm5_mcp_name_with_file_path_still_denies(
+        self, tmp_path: Path
+    ) -> None:
+        """KEY CONTROL, measured before the fix and still required after.
+
+        Feeding an MCP tool NAME together with a ``file_path`` key denied even
+        on the broken hook. That is what proves the defect was the KEY and not
+        a tool-name allowlist — and it is why a fix that special-cased
+        ``mcp__*`` tool names would have been aimed at the wrong thing.
+
+        It must keep denying after the fix, because the union still reads
+        ``file_path`` for every tool. A fix that made the classifier
+        AUTHORITATIVE would have flipped this to allow: ``write_targets``
+        resolves ``relative_path`` first for a registered MCP writer, and a
+        replacement extraction would have discarded the ``file_path`` the
+        payload actually carried.
+        """
+        repo = _init_repo(tmp_path / "repo")
+        payload = {
+            "tool_name": "mcp__serena__replace_symbol_body",
+            "tool_input": {
+                "file_path": "app/credentials.json",
+                "name_path": "Config/load",
+                "body": "...",
+            },
+        }
+        result = _run_hook(payload, cwd=repo)
+
+        assert _decision(result) == "deny", (
+            "an MCP tool name carrying a file_path key must still refuse; the "
+            "union reads file_path for EVERY tool. If this went allow the fix "
+            f"replaced the extraction instead of adding to it. {result.stdout!r}"
+        )
+
+    def test_regression_issue_1588_arm5_reason_names_the_mcp_target(
+        self, tmp_path: Path
+    ) -> None:
+        """The model-visible reason must name the path that tripped the rule.
+
+        Not cosmetic. ``permissionDecisionReason`` is the only channel the
+        model reads, and the old extraction left ``FILE_PATH`` empty — so a
+        refusal built on it would have said "Cannot write to sensitive file: "
+        with nothing after the colon, telling the model nothing it could act
+        on.
+        """
+        repo = _init_repo(tmp_path / "repo")
+        result = _run_hook(
+            _mcp_payload(
+                "mcp__serena__replace_content",
+                "certs/server.pem",
+                needle="a",
+                repl="b",
+                mode="literal",
+            ),
+            cwd=repo,
+        )
+        reason = json.loads(result.stdout)["hookSpecificOutput"][
+            "permissionDecisionReason"
+        ]
+        assert "certs/server.pem" in reason, (
+            "the refusal did not name the path it refused; the reason is the "
+            f"only thing the model sees. reason={reason!r}"
+        )
+
+    def test_regression_issue_1588_arm5_read_transport_is_still_seen(
+        self, tmp_path: Path
+    ) -> None:
+        """A deliberate NON-change, pinned because it looks like one.
+
+        MEASURED DISAGREEMENT WITH THE ARM-5 BRIEF, recorded rather than
+        silently resolved: the brief listed ``Read`` + a protected
+        ``file_path`` as a permitting arm that must "STAY allow". It was never
+        allow. Measured on the unfixed hook, it was ``deny`` — the extraction
+        read ``file_path`` for every tool name, ``Read`` included.
+
+        It still denies, and that is the correct outcome for this change:
+
+        * the union can only ADD a refusal, never remove one, which is the
+          property that makes the built-in table above immovable;
+        * making it allow would mean the guard SEES FEWER paths inside a
+          change whose entire purpose is making it see more;
+        * it is unreachable in production anyway — ``Read`` is not in this
+          hook's matcher, so Claude Code never routes it here.
+
+        Over-refusal on an unreachable transport is a cost worth naming and
+        not worth paying down inside a fail-open fix.
+        """
+        repo = _init_repo(tmp_path / "repo")
+        result = _run_hook(
+            _write_payload("app/credentials.json", tool_name="Read"), cwd=repo
+        )
+        assert _decision(result) == "deny", (
+            "Read + a protected file_path changed decision. The arm-5 union "
+            "must not remove any refusal the hook already made. "
+            f"stdout={result.stdout!r}"
+        )
+
+
+class TestIssue1588Arm5EveryTargetIsChecked:
+    """``write_targets`` returns a LIST, and the decision covers all of it.
+
+    A decision made from ``TARGETS[0]`` would be a guard scoped to the first
+    element — the same shape as a guard scoped to the instance that prompted
+    it, which this file has already committed once (arm 4 refused
+    ``secrets.yaml`` and permitted ``SECRETS.yaml``).
+
+    Deliberately authored to a DIFFERENT SHAPE than the reproducer. The bug
+    was an MCP editor with one ``relative_path``; these arms are a ``Bash``
+    command with two write targets, which is the only input in this repo that
+    exercises the multi-target path at all. A refusing case built from another
+    single-target MCP payload would prove nothing about the loop.
+    """
+
+    def test_regression_issue_1588_arm5_a_later_target_still_refuses(
+        self, tmp_path: Path
+    ) -> None:
+        """The SECOND target trips the rule, and the reason names IT."""
+        repo = _init_repo(tmp_path / "repo")
+        payload = {
+            "tool_name": "Bash",
+            "tool_input": {"command": "touch notes.txt; touch config/secrets.yaml"},
+        }
+        result = _run_hook(payload, cwd=repo)
+
+        assert _decision(result) == "deny", (
+            "a benign FIRST target masked a protected SECOND one, so the "
+            "decision is scoped to TARGETS[0] rather than to every target. "
+            f"stdout={result.stdout!r}"
+        )
+        reason = json.loads(result.stdout)["hookSpecificOutput"][
+            "permissionDecisionReason"
+        ]
+        assert "config/secrets.yaml" in reason and "notes.txt" not in reason, (
+            "the refusal must name the OFFENDING target, not whichever one "
+            f"happened to be first. reason={reason!r}"
+        )
+
+    def test_regression_issue_1588_arm5_all_benign_targets_permit(
+        self, tmp_path: Path
+    ) -> None:
+        """NEGATIVE CONTROL of a DIFFERENT SHAPE to the arm above.
+
+        Same transport, same multi-target structure, no protected path. If
+        this refused, the arm above would be passing because the loop refuses
+        everything it walks — indistinguishable from a guard that cannot
+        permit.
+        """
+        repo = _init_repo(tmp_path / "repo")
+        payload = {
+            "tool_name": "Bash",
+            "tool_input": {"command": "touch notes.txt; touch other.txt"},
+        }
+        result = _run_hook(payload, cwd=repo)
+
+        assert _decision(result) == "allow", (
+            "two ordinary write targets were refused; the multi-target loop "
+            f"refuses everything it sees. stdout={result.stdout!r}"
+        )
+        assert _read_block_rows(repo) == [], "allow must record nothing"
+
+
+class TestIssue1588Arm5DegradesToBuiltinNeverToAllow:
+    """The classifier is an ADDITION. Losing it must cost only MCP coverage.
+
+    The delegation spawns ``python3`` and imports ``tool_intent``. Both can be
+    absent on a damaged host. The union exists so that when they are, the jq
+    ``file_path`` extraction still stands and every built-in refusal survives
+    — the same enforcement-over-telemetry ordering used everywhere else in
+    this file, applied to classification.
+
+    ``tool_intent`` is made unimportable by placing a module of that name in
+    the hook's working directory, which is ``sys.path[0]`` for ``python3 -c``.
+    That shadows the real module for the classifier call and leaves
+    ``hook_telemetry`` untouched, so the degraded refusal is still recorded.
+    """
+
+    @staticmethod
+    def _poison(repo: Path) -> None:
+        """Shadow ``tool_intent`` with a module that raises on import."""
+        (repo / "tool_intent.py").write_text(
+            'raise ImportError("simulated: tool_intent unimportable")\n',
+            encoding="utf-8",
+        )
+
+    def test_regression_issue_1588_arm5_unimportable_classifier_keeps_builtin_coverage(
+        self, tmp_path: Path
+    ) -> None:
+        """THE CONSTRAINT. Built-in coverage must never depend on the classifier."""
+        repo = _init_repo(tmp_path / "repo")
+        self._poison(repo)
+
+        result = _run_hook(
+            _write_payload("app/credentials.json", tool_name="Write"), cwd=repo
+        )
+        assert _decision(result) == "deny", (
+            "with tool_intent unimportable the hook stopped refusing a "
+            "built-in write to credentials.json. The classifier was made "
+            "load-bearing for the transport it was never needed for, which "
+            f"turns a missing interpreter into a fail-open. {result.stdout!r}"
+        )
+        rows = _read_block_rows(repo)
+        assert len(rows) == 1 and rows[0]["metadata"]["decision"] == "deny", (
+            f"the degraded refusal was not recorded; rows={rows!r}"
+        )
+
+    def test_regression_issue_1588_arm5_degradation_probe_has_both_controls(
+        self, tmp_path: Path
+    ) -> None:
+        """The probe must be shown to DO something, and to be what did it.
+
+        POSITIVE CONTROL: with the shadow in place, an MCP write to a
+        protected path goes back to ``allow`` — the pre-fix behaviour. That is
+        the acceptable half of the degradation, and observing it is what
+        proves the shadow actually reached the classifier rather than the
+        payload being mishandled somewhere else.
+
+        NEGATIVE CONTROL: the identical payload in an identical repo WITHOUT
+        the shadow refuses. Without this half, a green positive control would
+        be indistinguishable from a fix that never worked.
+        """
+        payload = _mcp_payload(
+            "mcp__serena__replace_symbol_body",
+            "app/credentials.json",
+            name_path="Config/load",
+            body="...",
+        )
+
+        poisoned = _init_repo(tmp_path / "poisoned")
+        self._poison(poisoned)
+        degraded = _decision(_run_hook(payload, cwd=poisoned))
+
+        clean = _init_repo(tmp_path / "clean")
+        enforced = _decision(_run_hook(payload, cwd=clean))
+
+        assert enforced == "deny", (
+            "NEGATIVE CONTROL FAILED: the same MCP payload does not refuse "
+            "even with the classifier available, so the positive control "
+            f"below proves nothing about the shadow. got {enforced!r}"
+        )
+        assert degraded == "allow", (
+            "POSITIVE CONTROL FAILED: the shadow module did not make "
+            "tool_intent unimportable, so this whole class is measuring "
+            f"nothing. got {degraded!r}"
+        )
+
+
+class TestIssue1588Arm5DelegatesRatherThanEnumerates:
+    """The fix must not become a list of key names.
+
+    Adding ``relative_path`` to the jq expression would pass every behavioural
+    arm above and still fall through on the next MCP server that names its
+    argument ``path`` or ``target_file``. That is arm 4's defect exactly — "an
+    alternation like ``SECRETS|Secrets|secrets`` is the same defect with more
+    spellings" — one abstraction level up.
+
+    Behaviour cannot show this: a hook that enumerated three keys and a hook
+    that delegates are indistinguishable on every payload anyone has thought
+    to write. Reading the source is the only instrument that can, so it is
+    used here, with controls.
+    """
+
+    def test_regression_issue_1588_arm5_no_transport_key_is_enumerated(self) -> None:
+        """No path key but the built-in one may appear in real code."""
+        tool_intent = _load_tool_intent()
+        # Premise: an empty key list would make this check vacuous.
+        assert len(tool_intent.PATH_KEYS) >= 2, (
+            f"tool_intent.PATH_KEYS is {tool_intent.PATH_KEYS!r}; with fewer "
+            f"than two keys this check has nothing to look for"
+        )
+        source = HOOK_PATH.read_text(encoding="utf-8")
+
+        assert _jq_extracted_tool_input_keys(source) == {"file_path"}, (
+            "the hook reads more than one tool_input key with jq. Every "
+            "transport-specific key belongs in tool_intent.PATH_KEYS, where "
+            "one registration covers every enforcement site, not in a jq "
+            f"expression here. found={_jq_extracted_tool_input_keys(source)}"
+        )
+        enumerated = _enumerated_transport_keys(source, tool_intent.PATH_KEYS)
+        assert enumerated == set(), (
+            f"the hook names transport-specific path keys {sorted(enumerated)} "
+            f"in real code. That is arm 4 one level up: the list still falls "
+            f"through on the next server that calls its argument something "
+            f"else. Register the tool in tool_intent instead."
+        )
+
+    def test_regression_issue_1588_arm5_enumeration_detector_has_both_controls(
+        self,
+    ) -> None:
+        """POSITIVE and NEGATIVE controls for both source readers above."""
+        path_keys = ("file_path", "notebook_path", "relative_path", "path")
+
+        # POSITIVE: the exact wrong fix this class exists to refuse.
+        wrong_fix = (
+            "FILE_PATH=$(echo \"$TOOL_USE\" | jq -r "
+            "'.tool_input.file_path // .tool_input.relative_path // empty')\n"
+        )
+        assert _jq_extracted_tool_input_keys(wrong_fix) == {
+            "file_path",
+            "relative_path",
+        }, "the jq reader missed a second extracted key"
+        assert _enumerated_transport_keys(wrong_fix, path_keys) == {
+            "relative_path"
+        }, "the key reader missed an enumerated transport key"
+
+        # NEGATIVE: prose naming the key is not code naming it. Without this
+        # the hook's own header — which must explain relative_path to justify
+        # NOT enumerating it — would fail its own check.
+        prose = "# MCP editors carry their target under relative_path, not file_path\n"
+        assert _enumerated_transport_keys(prose, path_keys) == set(), (
+            "a comment explaining relative_path was counted as code"
+        )
+        assert _jq_extracted_tool_input_keys(prose) == set()
+
+        # NEGATIVE: a substring must not masquerade as the key.
+        lookalike = 'PYTHONPATH="$LIB_DIR" python3 -c "import pathlib"\n'
+        assert _enumerated_transport_keys(lookalike, path_keys) == set(), (
+            "a token merely CONTAINING a key name was flagged"
+        )
+
+    def test_regression_issue_1588_arm5_classifier_is_actually_consulted(self) -> None:
+        """Q1: is the delegation CONNECTED, by a route a machine can check?
+
+        The behavioural arms are the real proof. This adds the one thing they
+        cannot: that the route runs through ``tool_intent.write_targets`` —
+        the module the rest of the repo's enforcement sites already share —
+        rather than through a second private mapping that happens to give the
+        same answers today and drifts tomorrow.
+        """
+        source = _non_comment_source(HOOK_PATH.read_text(encoding="utf-8"))
+        assert "import tool_intent" in source, (
+            "the hook does not import the classifier in real code; if the "
+            "MCP arms are green, something else is resolving those paths"
+        )
+        assert "tool_intent.write_targets(" in source, (
+            "the hook imports tool_intent but does not call write_targets(); "
+            "the canonical answer to 'what would this write?' is that "
+            "function, not a reimplementation beside it"
+        )
+        assert TOOL_INTENT_PATH.exists(), (
+            f"{TOOL_INTENT_PATH} is missing, so the import above resolves to "
+            f"nothing and the hook silently degrades to built-ins only"
+        )

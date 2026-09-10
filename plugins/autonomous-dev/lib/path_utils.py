@@ -37,6 +37,8 @@ Design Patterns:
 """
 
 import json
+import os
+import sys
 from pathlib import Path
 from typing import Optional, List, Callable
 
@@ -55,6 +57,121 @@ _is_worktree_func: Optional[Callable[[], bool]] = None
 class PolicyFileNotFoundError(Exception):
     """Exception raised when policy file cannot be found in any location."""
     pass
+
+
+class LogDirResolutionError(RuntimeError):
+    """Raised when the activity-log directory cannot be tied to a project root.
+
+    Issue #1726: the previous behaviour on this path was an unconditional
+    ``cwd / ".claude" / "logs" / "activity"`` fallback, which silently split
+    the session record across whatever directory the hook happened to run in.
+    Failing loudly is the point — a partial log that nobody can tell is
+    partial is worse than no log.
+    """
+    pass
+
+
+def _worktree_parent_log_dir(start: Path) -> Optional[Path]:
+    """Resolve the PARENT repo's activity-log dir when ``start`` is a worktree.
+
+    Issue #755: hooks running inside ``<repo>/.worktrees/<name>/`` must write to
+    the parent repo's log so post-session analysis sees one record, not two.
+
+    Args:
+        start: Absolute path to resolve from (normally the current directory).
+
+    Returns:
+        ``<parent_repo>/.claude/logs/activity`` when ``start`` is inside a
+        ``.worktrees/`` tree AND the parent repo has a ``.claude`` directory;
+        otherwise None (caller falls through to the normal resolution).
+    """
+    start_str = str(start)
+    if "/.worktrees/" not in start_str and "\\.worktrees\\" not in start_str:
+        return None
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            capture_output=True, text=True, timeout=5, cwd=start_str,
+        )
+        if result.returncode != 0:
+            return None
+        common_dir = Path(result.stdout.strip())
+        parent_repo = common_dir.parent if common_dir.name == ".git" else common_dir
+        claude_dir = parent_repo / ".claude"
+        if claude_dir.exists():
+            return claude_dir / "logs" / "activity"
+    except Exception:
+        return None
+    return None
+
+
+def resolve_activity_log_dir(*, start_path: Optional[Path] = None) -> Path:
+    """Resolve ``<project_root>/.claude/logs/activity`` — never relative to cwd.
+
+    Canonical resolver for every hook that appends to the session activity log.
+    Issue #1726: three producers (``session_activity_logger``,
+    ``unified_session_tracker``, ``unified_pre_tool``) each walked up from the
+    current directory to the FIRST ``.claude/`` they found and fell back to
+    ``cwd/.claude/logs/activity`` when there was none. One stray ``.claude/``
+    below the repo root therefore captured every subsequent hook invocation
+    from a deeper directory — permanently, because the walk-up keeps finding
+    it first.
+
+    Resolution order:
+
+    1. **Worktree parent** (Issue #755) — when ``start_path`` is inside a
+       ``.worktrees/`` tree, the parent repo's ``.claude`` wins. Checked first
+       so a ``CLAUDE_PROJECT_DIR`` pointing at the worktree cannot reopen the
+       split #755 closed.
+    2. ``CLAUDE_PROJECT_DIR`` when set to an existing directory.
+    3. :func:`find_project_root`, which searches for ``.git`` all the way up
+       before considering ``.claude`` — that priority is precisely what makes
+       a stray ``.claude`` below the root lose.
+    4. Loud failure — :class:`LogDirResolutionError`, never a cwd fallback.
+
+    Args:
+        start_path: Directory to resolve from. Defaults to the current
+            working directory.
+
+    Returns:
+        Absolute path to the activity-log directory. The directory is NOT
+        created; callers do that.
+
+    Raises:
+        LogDirResolutionError: If no project root can be determined.
+    """
+    start = Path(start_path) if start_path is not None else Path.cwd()
+
+    worktree_dir = _worktree_parent_log_dir(start)
+    if worktree_dir is not None:
+        return worktree_dir
+
+    env_root = os.environ.get("CLAUDE_PROJECT_DIR", "").strip()
+    if env_root:
+        candidate = Path(env_root)
+        try:
+            if candidate.is_dir():
+                return candidate / ".claude" / "logs" / "activity"
+        except OSError:
+            pass  # Unreadable value is not a reason to fall back to cwd
+
+    try:
+        root = find_project_root(start_path=start)
+    except FileNotFoundError as exc:
+        message = (
+            f"Cannot resolve the activity-log directory from {start}\n"
+            f"Expected: CLAUDE_PROJECT_DIR set, or a .git/.claude marker in an "
+            f"ancestor directory\n"
+            f"Refusing to fall back to the current directory (Issue #1726)"
+        )
+        try:
+            sys.stderr.write(f"[path_utils] {message}\n")
+        except Exception:
+            pass
+        raise LogDirResolutionError(message) from exc
+
+    return root / ".claude" / "logs" / "activity"
 
 
 def find_project_root(

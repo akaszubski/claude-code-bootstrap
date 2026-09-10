@@ -130,11 +130,15 @@ REQUIRED_DENY_PATTERNS = [
     "Read(~/.ssh/**)",
     "Read(~/.aws/**)",
 
-    # Sensitive file writes
-    "Write(/etc/**)",
-    "Write(/System/**)",
-    "Write(/usr/**)",
-    "Write(~/.ssh/**)",
+    # Sensitive file writes (Issue #1409): Edit(<path>) is the only path-scoped
+    # file rule Claude Code consults — it governs Write, Edit and NotebookEdit
+    # alike, so a Write(<path>) deny is accepted but never matched. The DOUBLE
+    # leading slash is also required: a single slash anchors to the settings
+    # source directory, not the filesystem root.
+    "Edit(//etc/**)",
+    "Edit(//System/**)",
+    "Edit(//usr/**)",
+    "Edit(~/.ssh/**)",
 
     # Privilege escalation
     "Bash(sudo:*)",

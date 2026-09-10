@@ -8,10 +8,18 @@ Verified live: blocked a spektiv `/implement --fix` cleanup step.
 
 This test locks two things:
 
-1. No pipeline STATE-FILE cleanup line in `commands/implement*.md` uses
-   the denied `rm -f`/`rm -rf` flags (the actual #1411 bug class).
+1. No pipeline STATE-FILE cleanup line in any coordinator uses the denied
+   `rm -f`/`rm -rf` flags (the actual #1411 bug class).
 2. The state-file cleanup step still references/removes the state file
    (the fix must not have silently deleted cleanup behavior).
+
+Coverage: the file list is IMPORTED from
+`tests/regression/test_implement_md_state_contract.py` as `ALL_COORDINATORS`
+rather than restated here. That module discovers coordinators by file CONTENT
+and pins the result against disk, so a fifth coordinator joins this test's
+scope automatically. Arm 1 runs over all four; arms 2 and 3 run over
+`CLEANUP_COORDINATORS`, derived by SUBTRACTION with per-arm reasons that are
+NOT the same reason — read them, they differ in polarity.
 
 Scope note: #1411 intentionally fixed only the pipeline STATE-FILE
 cleanup sites (4 of them, across implement.md / implement-fix.md /
@@ -28,6 +36,15 @@ from pathlib import Path
 
 import pytest
 
+# ONE list, not two. ``ALL_COORDINATORS`` is content-discovered and pinned
+# against disk by ``TestCoordinatorCoverageIsMechanical`` in that module; a
+# second literal list here would be a fourth hand-maintained copy of the same
+# fact. Package import (no ``sys.path.insert``) — ``tests/__init__.py`` and
+# ``tests/regression/__init__.py`` both exist, so this resolves under pytest's
+# default ``prepend`` import mode without binding a second module object under
+# a different ``__name__``.
+from tests.regression.test_implement_md_state_contract import ALL_COORDINATORS
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 COMMANDS_DIR = REPO_ROOT / "plugins" / "autonomous-dev" / "commands"
 
@@ -35,7 +52,14 @@ IMPLEMENT_MD = COMMANDS_DIR / "implement.md"
 IMPLEMENT_FIX_MD = COMMANDS_DIR / "implement-fix.md"
 IMPLEMENT_BATCH_MD = COMMANDS_DIR / "implement-batch.md"
 
-FILES = [IMPLEMENT_MD, IMPLEMENT_FIX_MD, IMPLEMENT_BATCH_MD]
+FILES = list(ALL_COORDINATORS)
+
+# Derived by SUBTRACTION, so a fifth coordinator joins both sets by default.
+# implement-resume.md is the sole exclusion and the reason differs per arm —
+# see the two inline reasons on the tests below. They are NOT the same reason.
+CLEANUP_COORDINATORS = tuple(
+    c for c in ALL_COORDINATORS if c.name != "implement-resume.md"
+)
 
 # Matches an *actual* rm invocation (not prose that merely mentions
 # "rm -f" while explaining the deny rule) targeting one of the known
@@ -73,9 +97,24 @@ def test_no_denied_rm_flags_for_state_file_cleanup(file_path: Path) -> None:
     )
 
 
-@pytest.mark.parametrize("file_path", FILES, ids=lambda p: p.name)
+@pytest.mark.parametrize("file_path", CLEANUP_COORDINATORS, ids=lambda p: p.name)
 def test_state_file_cleanup_still_happens(file_path: Path) -> None:
-    """The fix must not have deleted the cleanup call itself."""
+    """The fix must not have deleted the cleanup call itself.
+
+    implement-resume.md is subtracted because widening this arm to it would be
+    GREEN-ON-PROSE, **not** RED. ``STATE_FILE_REFERENCES`` includes the bare
+    string ``"PIPELINE_STATE_FILE"``, and implement-resume.md:65 mentions it in
+    a PROSE SENTENCE ("Restore ``PIPELINE_STATE_FILE`` env var to point at
+    ``/tmp/pipeline_state_<run_id>.json``"). So the assertion would pass while
+    resume has no cleanup construct at all — a vacuous green of exactly the
+    polarity ``test_implement_md_state_contract.py``'s resume pins exist to
+    reverse.
+
+    Tightening this arm instead was considered and REJECTED: a tightened
+    version demanding an actual deletion construct is byte-for-byte the check
+    ``test_state_file_cleanup_uses_force_free_deletion`` already performs — a
+    second copy of one check, which is a "one canonical way" violation.
+    """
     content = file_path.read_text()
     assert any(ref in content for ref in STATE_FILE_REFERENCES), (
         f"{file_path.name} no longer references the pipeline state file in "
@@ -84,13 +123,19 @@ def test_state_file_cleanup_still_happens(file_path: Path) -> None:
     )
 
 
-@pytest.mark.parametrize("file_path", FILES, ids=lambda p: p.name)
+@pytest.mark.parametrize("file_path", CLEANUP_COORDINATORS, ids=lambda p: p.name)
 def test_state_file_cleanup_uses_force_free_deletion(file_path: Path) -> None:
     """Each file's state-file cleanup uses a non-denied deletion form.
 
     Accepts either `rm -- "$FILE" ... || true` (plain rm, no -f/-rf flag,
     guarded with `--`) or a Python `pathlib.Path(...).unlink(missing_ok=True)`
     one-liner. Either form avoids the denied `-f`/`-rf` flags entirely.
+
+    implement-resume.md is subtracted for a DIFFERENT reason than the arm
+    above, and this one genuinely goes RED when widened: MEASURED, resume has
+    ZERO ``rm`` invocations and ZERO ``unlink(missing_ok=True)``, so neither
+    accepted form is present. **Resume has no cleanup by design** — it hands
+    the run back to a live pipeline rather than ending one.
     """
     content = file_path.read_text()
     has_plain_rm_guard = bool(

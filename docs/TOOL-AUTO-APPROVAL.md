@@ -188,7 +188,6 @@ Add to `~/.claude/settings.json` (user-level) for auto-approval of all tools:
     "allow": [
       "Bash(:*)",
       "Read(**)",
-      "Write(**)",
       "Edit(**)",
       "Glob",
       "Grep",
@@ -242,10 +241,19 @@ Add to `~/.claude/settings.json` (user-level) for auto-approval of all tools:
 | Bash (prefix) | `Bash(npm run:*)` | Allows `npm run test`, `npm run build`, etc. |
 | Read (all) | `Read(**)` | Allows reading any file |
 | Read (path) | `Read(./src/**)` | Allows reading files in src/ |
-| Write (all) | `Write(**)` | Allows writing any file |
-| Edit (all) | `Edit(**)` | Allows editing any file |
-| Other tools | `Glob`, `Grep`, `WebFetch` | Just the tool name |
+| Edit (all) | `Edit(**)` | Allows writing AND editing any file — see note below |
+| Other tools | `Write`, `Glob`, `Grep`, `WebFetch` | Just the tool name |
 | MCP tools | `mcp__` | Prefix for all MCP server tools |
+
+**Path-scoped file rules: use `Edit(path)`, never `Write(path)` (Issue #1409).**
+Claude Code checks file permissions against `Edit(path)` and `Read(path)` rules
+only. A path rule written for `Write`, `NotebookEdit`, `Glob`, or the legacy
+`MultiEdit` is accepted and warned about at startup, but never consulted — so
+`Write(docs/**)` grants and `Write(~/.ssh/**)` denies are both no-ops. One
+`Edit(path)` rule governs Write, Edit and NotebookEdit alike. A **bare** tool
+name with no parentheses (`"Write"`) is different: it matches at the tool level
+everywhere, is not warned about, and is the correct way to grant or deny a whole
+tool.
 
 **Important**: Claude Code uses **prefix matching** for Bash, not regex. Use `:*` at the end for wildcards.
 
@@ -364,9 +372,8 @@ Claude Code uses **prefix matching** for permissions (not regex):
 | Bash prefix | `Bash(pytest:*)` | `pytest`, `pytest tests/`, `pytest -v` |
 | All file reads | `Read(**)` | Any file path |
 | Specific directory | `Read(./src/**)` | Files in src/ directory |
-| All file writes | `Write(**)` | Any file path |
-| All file edits | `Edit(**)` | Any file path |
-| Simple tools | `Glob`, `Grep`, `WebFetch` | Just the tool name |
+| All file writes AND edits | `Edit(**)` | Any file path — see note below |
+| Simple tools | `Write`, `Glob`, `Grep`, `WebFetch` | Just the tool name |
 | All MCP tools | `mcp__` | Any MCP server tool (prefix match) |
 
 **Three Permission Levels**:

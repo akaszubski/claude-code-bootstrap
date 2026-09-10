@@ -2486,6 +2486,113 @@ def _is_plugin_source_path(file_path: str) -> bool:
         return False
 
 
+def _targets_nested_claude_dir(file_path: str) -> bool:
+    """True iff ``file_path`` sits in a ``.claude/`` nested under plugin source.
+
+    Issue #1726: two stray ``.claude/`` trees accumulated inside
+    ``plugins/autonomous-dev/`` — a directory that ships to consumer repos via
+    ``install_manifest.json`` and is not covered by the root ``.gitignore``.
+    They were self-perpetuating: any cwd walk-up from a deeper directory found
+    the stray first, forever.
+
+    The refused class is "a ``.claude`` path component appearing BELOW a real
+    ``plugins/autonomous-dev/`` source tree" — not one named subdirectory.
+    Three conditions must all hold, so the legitimate cases stay permitted:
+
+    * ``plugins`` and ``autonomous-dev`` are adjacent components, and
+    * some later component is exactly ``.claude`` — which is why the
+      marketplace install layout ``~/.claude/plugins/autonomous-dev/...``
+      (``.claude`` BEFORE the plugin dir) and the shipped ``.claude-plugin/``
+      directory are both permitted, and
+    * the tree carries the canonical
+      ``plugins/autonomous-dev/.claude-plugin/marketplace.json`` marker, so a
+      look-alike layout under ``/tmp`` is not gated.
+
+    Args:
+        file_path: The candidate write target.
+
+    Returns:
+        True when the write belongs to the refused class.
+    """
+    if not file_path:
+        return False
+    try:
+        parts = Path(file_path).resolve().parts
+        adj_idx: int | None = None
+        for i, part in enumerate(parts):
+            if part == "plugins" and i + 1 < len(parts) and parts[i + 1] == "autonomous-dev":
+                adj_idx = i
+                break
+        if adj_idx is None:
+            return False
+        if ".claude" not in parts[adj_idx + 2:]:
+            return False
+        repo_root = Path(*parts[:adj_idx]) if adj_idx > 0 else Path(parts[0])
+        marker = repo_root / "plugins" / "autonomous-dev" / ".claude-plugin" / "marketplace.json"
+        return marker.exists()
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _enforce_no_nested_claude_dir(tool_name: str, tool_input: dict) -> None:
+    """Refuse writes that create a ``.claude/`` tree inside plugin source (#1726).
+
+    Companion to the Issue #1726 resolver fix: the three hooks no longer WRITE
+    stray activity logs there, and this refuses anything else from CREATING the
+    directory again. Runs for every write transport via ``_ti_is_write`` /
+    ``_ti_write_targets``, so MultiEdit, NotebookEdit and MCP editors are
+    covered, not just Write/Edit.
+
+    Bash is deliberately out of scope. Measured: ``tool_intent.write_targets``
+    reports the SOURCE of a deletion as a write target
+    (``rm -rf plugins/autonomous-dev/commands/.claude`` ->
+    ``['plugins/autonomous-dev/commands/.claude']``), so gating Bash here would
+    block the authorised removal of the two stray trees that already exist.
+
+    Args:
+        tool_name: The tool name from the PreToolUse payload.
+        tool_input: The tool input dict from the PreToolUse payload.
+
+    Returns:
+        None. Exits the process with a deny decision when the write is refused.
+    """
+    if tool_name == "Bash":
+        return
+    try:
+        if not _ti_is_write(tool_name, tool_input):
+            return
+        offending = next(
+            (t for t in _ti_write_targets(tool_name, tool_input)
+             if _targets_nested_claude_dir(t)),
+            None,
+        )
+    except Exception:
+        return  # Never fail the hook for this check — it is additive, not a floor
+    if offending is None:
+        return
+
+    block_reason = (
+        f"BLOCKED: '{offending}' would create a .claude/ directory inside "
+        f"plugins/autonomous-dev/ — shipped plugin source that is NOT covered "
+        f"by the root .gitignore, so the tree gets distributed to consumer "
+        f"repos and committed by one 'git add -A'. Stray .claude/ trees are "
+        f"self-perpetuating and split the session record. (Issue #1726) "
+        f"REQUIRED NEXT ACTION: Write to the repo-root .claude/ instead, or "
+        f"choose a path outside plugins/autonomous-dev/."
+    )
+    _log_deviation(Path(offending).name, tool_name, "nested_claude_dir_block")
+    _log_pretool_activity(tool_name, tool_input, "deny", block_reason)
+    output_decision(
+        "deny", block_reason,
+        system_message=(
+            f"BLOCKED: refusing to create a .claude/ directory inside "
+            f"plugins/autonomous-dev/ ('{offending}'). Use the repo-root "
+            f".claude/ instead. (Issue #1726)"
+        ),
+    )
+    sys.exit(0)
+
+
 def _is_batch_context(cwd: str) -> bool:
     """Return True when the current invocation is part of a batch.
 
@@ -6231,12 +6338,44 @@ def _extract_bash_file_writes_legacy(command: str) -> list:
     return file_paths
 
 
+def _resolved_logs_dir() -> "Path | None":
+    """Return ``<project_root>/.claude/logs``, or None when unresolvable.
+
+    Issue #1726: both loggers below derived their log path from the process's
+    current directory (``os.getcwd()``), so PreToolUse records and deviation
+    records landed in whatever directory the hook happened to run in — including
+    ``plugins/autonomous-dev/commands/.claude/logs/`` inside shipped plugin
+    source. Resolution now goes through the canonical resolver, and an
+    unresolvable root skips the write with a stderr warning instead of creating
+    a stray tree.
+
+    Returns:
+        The project's ``.claude/logs`` directory, or None if it cannot be tied
+        to a project root.
+    """
+    try:
+        from path_utils import resolve_activity_log_dir
+        # resolve_activity_log_dir() returns <root>/.claude/logs/activity
+        return resolve_activity_log_dir().parent
+    except Exception as exc:
+        try:
+            sys.stderr.write(
+                f"[unified_pre_tool] logging skipped, no project root: {exc} "
+                f"(Issue #1726)\n"
+            )
+        except Exception:
+            pass
+        return None
+
+
 def _log_deviation(file_name: str, tool_name: str, reason: str) -> None:
     """Append deviation to .claude/logs/deviations.jsonl for analytics."""
     try:
         import json as _json
         from datetime import datetime as _dt
-        log_dir = Path(os.getcwd()) / ".claude" / "logs"
+        log_dir = _resolved_logs_dir()
+        if log_dir is None:
+            return
         log_dir.mkdir(parents=True, exist_ok=True)
         entry = {
             "timestamp": _dt.now().isoformat(),
@@ -6624,8 +6763,13 @@ def _log_write_gate_bypass_consumed(file_path: str, skip_file: Path) -> None:
         if not reason:
             reason = "unspecified"
 
-        # Prepare log entry
-        log_dir = Path(os.getcwd()) / ".claude" / "logs" / "activity"
+        # Prepare log entry (Issue #1726: root-anchored, never cwd-anchored —
+        # a bypass-consumption record hidden in a stray tree is an unauditable
+        # bypass).
+        _logs_dir = _resolved_logs_dir()
+        if _logs_dir is None:
+            return
+        log_dir = _logs_dir / "activity"
         log_dir.mkdir(parents=True, exist_ok=True)
         date_str = _dt.now().strftime("%Y-%m-%d")
 
@@ -6690,7 +6834,11 @@ def _log_write_gate_bypass_deferred(file_path: str, call_key: str) -> None:
         except Exception:
             pass
 
-        log_dir = Path(os.getcwd()) / ".claude" / "logs" / "activity"
+        # Issue #1726: root-anchored, never cwd-anchored.
+        _logs_dir = _resolved_logs_dir()
+        if _logs_dir is None:
+            return
+        log_dir = _logs_dir / "activity"
         log_dir.mkdir(parents=True, exist_ok=True)
         date_str = _dt.now().strftime("%Y-%m-%d")
 
@@ -6719,7 +6867,10 @@ def _log_pretool_activity(tool_name: str, tool_input: Dict, decision: str, reaso
     try:
         import json as _json
         from datetime import datetime as _dt, timezone as _tz
-        log_dir = Path(os.getcwd()) / ".claude" / "logs" / "activity"
+        _logs_dir = _resolved_logs_dir()
+        if _logs_dir is None:
+            return
+        log_dir = _logs_dir / "activity"
         log_dir.mkdir(parents=True, exist_ok=True)
         date_str = _dt.now().strftime("%Y-%m-%d")
 
@@ -8622,6 +8773,17 @@ def main():
         # for another.
         # =================================================================
         _enforce_protected_infrastructure(tool_name, tool_input)
+
+        # =================================================================
+        # NESTED .claude/ REFUSAL (Issue #1726).
+        #
+        # Placed beside the hard floor and BEFORE the native-tool fast path for
+        # the same reason: the fast path terminates in an unconditional allow,
+        # so anything gated inside it only covers the tool names spelled out
+        # there. Companion to the resolver fix that stopped the three hooks
+        # from writing their own stray trees.
+        # =================================================================
+        _enforce_no_nested_claude_dir(tool_name, tool_input)
 
         # =================================================================
         # FAST PATH: Native tools skip ALL hook layers.

@@ -83,13 +83,9 @@
       "Read(~/.aws/**)",
       "Read(~/.config/gh/**)",
       "Edit(//etc/**)",
-      "Write(//etc/**)",
       "Edit(//System/**)",
-      "Write(//System/**)",
       "Edit(//usr/**)",
-      "Write(//usr/**)",
-      "Edit(~/.ssh/**)",
-      "Write(~/.ssh/**)"
+      "Edit(~/.ssh/**)"
     ]
   },
   "hooks": {

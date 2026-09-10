@@ -71,6 +71,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
+# Issue #1726: canonical activity-log resolution lives in lib/path_utils.py.
+# The lib bootstrap above already put lib/ on sys.path. If it is unavailable we
+# fail loudly at call time rather than silently logging into the current
+# directory — a cwd fallback is the defect this import replaces.
+try:
+    from path_utils import LogDirResolutionError, resolve_activity_log_dir
+except ImportError:  # pragma: no cover - exercised only on a broken install
+    resolve_activity_log_dir = None  # type: ignore[assignment]
+
+    class LogDirResolutionError(RuntimeError):  # type: ignore[no-redef]
+        """Fallback when lib/path_utils.py is not importable."""
+
 
 # ============================================================================
 # Dynamic Library Discovery
@@ -227,22 +239,30 @@ def _get_current_issue_number() -> int:
 
 
 def _find_log_dir() -> Path:
-    """Find the .claude/logs/activity directory.
+    """Find the project's .claude/logs/activity directory.
 
-    Walks up from cwd to find an existing .claude directory, then uses
-    its logs/activity subdirectory. Falls back to cwd/.claude/logs/activity.
+    Delegates to :func:`path_utils.resolve_activity_log_dir` — worktree parent
+    (Issue #755) -> ``CLAUDE_PROJECT_DIR`` -> project root -> loud failure.
+
+    Issue #1726: this walked up from cwd to the first ``.claude/`` and fell back
+    to ``cwd/.claude/logs/activity``, so Heartbeat and SubagentStop records
+    landed in stray trees inside shipped plugin source whenever a hook ran from
+    a nested directory.
 
     Returns:
-        Path to the activity log directory.
-    """
-    cwd = Path.cwd()
-    for parent in [cwd] + list(cwd.parents):
-        claude_dir = parent / ".claude"
-        if claude_dir.exists():
-            return claude_dir / "logs" / "activity"
+        Path to the activity log directory (not created here).
 
-    # Fallback to cwd
-    return cwd / ".claude" / "logs" / "activity"
+    Raises:
+        LogDirResolutionError: If no project root can be resolved.
+    """
+    if resolve_activity_log_dir is None:
+        raise LogDirResolutionError(
+            "lib/path_utils.py is not importable, so the activity-log directory "
+            "cannot be tied to a project root.\n"
+            "Expected: plugins/autonomous-dev/lib/ on sys.path\n"
+            "Refusing to fall back to the current directory (Issue #1726)"
+        )
+    return resolve_activity_log_dir(start_path=Path(str(Path.cwd())))
 
 
 def _get_session_date(session_id: str) -> str:
